@@ -53,6 +53,7 @@ type ModelConnection = { id: string; name: string; provider: string; baseUrl: st
 type ApiConnection = { id: string; kind: "api"; name: string; description: string; url: string; method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; headers: Record<string, string>; inputSchema: Record<string, unknown> };
 type McpConnection = { id: string; kind: "mcp"; name: string; description: string; serverUrl: string; headers: Record<string, string>; requireApproval: "always" | "never" };
 type Connection = ApiConnection | McpConnection;
+type RuntimeStatus = "disconnected" | "starting" | "ready" | "error";
 
 const KEY = "kchat-api-key";
 const MODEL_CONNECTIONS = "kchat-model-connections-v1";
@@ -192,6 +193,10 @@ export default function Home() {
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("chat");
   const [codePane, setCodePane] = useState<"files" | "terminal" | "browser" | "agent">("files");
   const [codeCommand, setCodeCommand] = useState("");
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>("disconnected");
+  const [sandboxId, setSandboxId] = useState("");
+  const [previewUrl, setPreviewUrl] = useState("");
+  const [runtimeFileContent, setRuntimeFileContent] = useState("");
   const [codeProject, setCodeProject] = useState("KChat");
   const [codeFile, setCodeFile] = useState("app/page.tsx");
   const [codeLog, setCodeLog] = useState<string[]>(["Workspace ready.", "Project folder: KChat", "No local terminal attached — connect a workspace agent to execute commands."]);
@@ -273,6 +278,86 @@ export default function Home() {
     () => chats.filter((chat) => chat.title.toLowerCase().includes(query.toLowerCase())),
     [chats, query],
   );
+
+  async function runtimeRequest(action: string, payload: Record<string, unknown> = {}) {
+    const response = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, sandboxId, ...payload }) });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Runtime request failed (${response.status})`);
+    return data;
+  }
+
+  async function startRuntime() {
+    if (runtimeStatus === "starting") return;
+    try {
+      setRuntimeStatus("starting");
+      const saved = sessionStorage.getItem("kchat-e2b-sandbox-id") || "";
+      if (saved) {
+        try {
+          const data = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "info", sandboxId: saved }) }).then(async (r) => ({ ok: r.ok, data: await r.json() }));
+          if (data.ok) { setSandboxId(saved); setRuntimeStatus("ready"); setCodeLog((prev) => [...prev, `E2B sandbox reconnected: ${saved.slice(0, 10)}…`]); return; }
+        } catch {}
+      }
+      const response = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "create" }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not create E2B sandbox");
+      setSandboxId(data.sandboxId);
+      sessionStorage.setItem("kchat-e2b-sandbox-id", data.sandboxId);
+      setRuntimeStatus("ready");
+      setCodeLog((prev) => [...prev, `E2B sandbox ready: ${String(data.sandboxId).slice(0, 10)}…`]);
+    } catch (e) {
+      setRuntimeStatus("error");
+      setCodeLog((prev) => [...prev, `E2B error: ${e instanceof Error ? e.message : "Unable to start sandbox"}`]);
+    }
+  }
+
+  async function runRuntimeCommand() {
+    const value = codeCommand.trim();
+    if (!value) return;
+    try {
+      if (!sandboxId || runtimeStatus !== "ready") await startRuntime();
+      const id = sandboxId || sessionStorage.getItem("kchat-e2b-sandbox-id") || "";
+      if (!id) throw new Error("E2B sandbox is not available");
+      const response = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "run", sandboxId: id, command: value }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Command failed");
+      setCodeLog((prev) => [...prev, `$ ${value}`, data.stdout || "(no stdout)", ...(data.stderr ? [`stderr: ${data.stderr}`] : []), `exit code: ${data.exitCode}`]);
+      setCodeCommand("");
+      setSandboxId(id); setRuntimeStatus("ready");
+    } catch (e) {
+      setCodeLog((prev) => [...prev, `Command error: ${e instanceof Error ? e.message : "Command failed"}`]);
+    }
+  }
+
+  async function readRuntimeFile(path: string) {
+    if (!sandboxId || runtimeStatus !== "ready") return;
+    try {
+      const data = await runtimeRequest("read", { path });
+      setRuntimeFileContent(String(data.content || ""));
+      setCodeLog((prev) => [...prev, `Read ${path}`]);
+    } catch (e) {
+      setCodeLog((prev) => [...prev, `Read error: ${e instanceof Error ? e.message : "Unable to read file"}`]);
+    }
+  }
+
+  async function openRuntimePreview() {
+    try {
+      if (!sandboxId || runtimeStatus !== "ready") await startRuntime();
+      const id = sandboxId || sessionStorage.getItem("kchat-e2b-sandbox-id") || "";
+      if (!id) throw new Error("E2B sandbox is not available");
+      const response = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "preview", sandboxId: id, port: 3000 }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not create preview URL");
+      setPreviewUrl(data.url); setCodeLog((prev) => [...prev, `Preview: ${data.url}`]);
+    } catch (e) { setCodeLog((prev) => [...prev, `Preview error: ${e instanceof Error ? e.message : "Unable to open preview"}`]); }
+  }
+
+  async function stopRuntime() {
+    if (!sandboxId) return;
+    try { await runtimeRequest("kill"); } catch {}
+    sessionStorage.removeItem("kchat-e2b-sandbox-id");
+    setSandboxId(""); setPreviewUrl(""); setRuntimeStatus("disconnected");
+    setCodeLog((prev) => [...prev, "E2B sandbox stopped."]);
+  }
 
   function openGrid() {
     setGridIds((prev) => {
@@ -917,11 +1002,18 @@ export default function Home() {
           pane={codePane}
           command={codeCommand}
           logs={codeLog}
+          runtimeStatus={runtimeStatus}
+          previewUrl={previewUrl}
+          fileContent={runtimeFileContent}
           onProject={setCodeProject}
-          onFile={setCodeFile}
+          onFile={(path) => { setCodeFile(path); if (runtimeStatus === "ready") void readRuntimeFile(path); }}
           onPane={setCodePane}
           onCommand={setCodeCommand}
-          onRun={() => { const command = codeCommand.trim() || "npm run dev"; setCodeLog((prev) => [...prev, `$ ${command}`, "Command queued. Connect a local coding agent/terminal to execute it."]); setCodeCommand(""); }}
+          onRun={() => { const command = codeCommand.trim() || "npm run dev"; setCodeCommand(command); void runRuntimeCommand(); }}
+          onStartRuntime={() => void startRuntime()}
+          onStopRuntime={() => void stopRuntime()}
+          onPreview={() => void openRuntimePreview()}
+          onRefreshFile={() => void readRuntimeFile(codeFile)}
           onAddLog={(text) => setCodeLog((prev) => [...prev, text])}
         /> : <AgentWorkspace onOpenCode={() => setWorkspaceMode("code")} onNewChat={newChat} />
       </section>
@@ -1033,7 +1125,7 @@ export default function Home() {
   );
 }
 
-function CodeWorkspace({ project, file, pane, command, logs, onProject, onFile, onPane, onCommand, onRun, onAddLog }: { project: string; file: string; pane: "files" | "terminal" | "browser" | "agent"; command: string; logs: string[]; onProject: (value: string) => void; onFile: (value: string) => void; onPane: (value: "files" | "terminal" | "browser" | "agent") => void; onCommand: (value: string) => void; onRun: () => void; onAddLog: (text: string) => void }) {
+function CodeWorkspace({ project, file, pane, command, logs, runtimeStatus, previewUrl, fileContent, onProject, onFile, onPane, onCommand, onRun, onStartRuntime, onStopRuntime, onPreview, onRefreshFile, onAddLog }: { project: string; file: string; pane: "files" | "terminal" | "browser" | "agent"; command: string; logs: string[]; runtimeStatus: RuntimeStatus; previewUrl: string; fileContent: string; onProject: (value: string) => void; onFile: (value: string) => void; onPane: (value: "files" | "terminal" | "browser" | "agent") => void; onCommand: (value: string) => void; onRun: () => void; onStartRuntime: () => void; onStopRuntime: () => void; onPreview: () => void; onRefreshFile: () => void; onAddLog: (text: string) => void }){
   const files = ["app/page.tsx", "app/globals.css", "app/layout.tsx", "lib/tool-registry.ts", "package.json", "README.md"];
   const snippets: Record<string, string> = {
     "app/page.tsx": "export default function Home() {\n  return <main>KChat</main>;\n}",
@@ -1047,7 +1139,7 @@ function CodeWorkspace({ project, file, pane, command, logs, onProject, onFile, 
   return <div className="code-workspace">
     <div className="code-toolbar">
       <div className="code-project"><div className="project-icon"><Code2 size={15}/></div><div><strong>{project}</strong><small>Project workspace</small></div></div>
-      <div className="code-toolbar-actions"><button onClick={() => onAddLog("Workspace check requested.")}><Play size={13}/> Run</button><button><GitBranch size={13}/> main</button><button><SplitSquareHorizontal size={13}/> Split</button></div>
+      <div className="code-toolbar-actions"><span className={`runtime-pill ${runtimeStatus}`}><i/> {runtimeStatus === "ready" ? "E2B ready" : runtimeStatus === "starting" ? "Starting…" : runtimeStatus === "error" ? "E2B error" : "E2B offline"}</span>{runtimeStatus === "ready" ? <button onClick={onStopRuntime}><Square size={12}/> Stop</button> : <button onClick={onStartRuntime}><Play size={13}/> Start runtime</button>}<button onClick={onRun}><Play size={13}/> Run</button><button><GitBranch size={13}/> main</button><button><SplitSquareHorizontal size={13}/> Split</button></div>
     </div>
     <div className="code-layout">
       <aside className="code-rail">
@@ -1057,10 +1149,10 @@ function CodeWorkspace({ project, file, pane, command, logs, onProject, onFile, 
         <div className="code-main-head"><span><i/> {paneTitle}</span><div><button title="Command bar"><Command size={14}/></button><button title="More"><MoreHorizontal size={14}/></button></div></div>
         {pane === "files" && <div className="code-files-view">
           <div className="file-tree"><div className="tree-project"><ChevronDown size={13}/><strong>{project}</strong></div>{files.map(path => <button key={path} className={file === path ? "selected" : ""} onClick={() => onFile(path)}><FileText size={13}/><span>{path}</span></button>)}</div>
-          <div className="code-editor"><div className="editor-tab"><FileText size={13}/>{file}<span>·</span><span>saved</span></div><pre>{snippets[file] || "// Select a file to inspect it."}</pre></div>
+          <div className="code-editor"><div className="editor-tab"><FileText size={13}/>{file}<span>·</span><button onClick={onRefreshFile}>refresh</button></div><pre>{fileContent || snippets[file] || "// Start the E2B runtime and select a file to inspect it."}</pre></div>
         </div>}
         {pane === "terminal" && <div className="terminal-view"><div className="terminal-output">{logs.map((line, i) => <div key={i} className={line.startsWith("$") ? "command-line" : ""}>{line}</div>)}</div><div className="terminal-input"><span>$</span><input value={command} onChange={e => onCommand(e.target.value)} onKeyDown={e => { if (e.key === "Enter") onRun(); }} placeholder="npm run dev"/><button onClick={onRun}><ArrowUp size={14}/></button></div></div>}
-        {pane === "browser" && <div className="browser-view"><div className="browser-bar"><span>localhost:3000</span><button onClick={() => onAddLog("Browser preview refreshed.")}><Play size={12}/></button></div><div className="browser-preview"><div className="preview-orb"><Sparkles size={22}/></div><strong>{project}</strong><span>Preview surface</span><small>Start a development server from the terminal to connect a live browser.</small></div></div>}
+        {pane === "browser" && <div className="browser-view"><div className="browser-bar"><span>{previewUrl || "localhost:3000"}</span><button onClick={onPreview}><Play size={12}/></button></div>{previewUrl ? <iframe className="live-preview" src={previewUrl} title={`${project} live preview`} /> : <div className="browser-preview"><div className="preview-orb"><Sparkles size={22}/></div><strong>{project}</strong><span>Live E2B preview</span><small>Run your development server on port 3000, then refresh this pane.</small></div>}</div>}
         {pane === "agent" && <div className="agent-view"><div className="agent-card"><div className="agent-avatar"><Bot size={18}/></div><div><strong>Build Agent</strong><span>Scoped to {project}</span></div><button onClick={() => onAddLog("Agent thread started for this workspace.")}>Start</button></div><div className="agent-empty"><Sparkles size={24}/><h3>What should we build?</h3><p>Give the coding agent a bounded objective. It can inspect files, propose changes and run verification once a local execution backend is connected.</p></div></div>}
         <div className="code-commandbar"><Command size={14}/><input placeholder="Ask the workspace agent to inspect, change, run or explain…" onKeyDown={e => { if (e.key === "Enter" && e.currentTarget.value.trim()) { onAddLog(`Agent request: ${e.currentTarget.value.trim()}`); e.currentTarget.value = ""; } }}/><span>⌘↵</span></div>
       </div>
