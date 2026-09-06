@@ -1014,7 +1014,7 @@ export default function Home() {
           onPreview={() => void openRuntimePreview()}
           onRefreshFile={() => void readRuntimeFile(codeFile)}
           onAddLog={(text) => setCodeLog((prev) => [...prev, text])}
-        /> : <AgentWorkspace onOpenCode={() => setWorkspaceMode("code")} onNewChat={newChat} />
+        /> : <AgentWorkspace onOpenCode={() => setWorkspaceMode("code")} onNewChat={newChat} />}
       </section>
 
       {fullscreenId && (() => {
