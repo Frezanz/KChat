@@ -598,6 +598,28 @@ export default function Home() {
     setKeyError("");
   }
 
+  function detectProviderFromKey(value: string) {
+    const key = value.trim();
+    if (/^AQ\./i.test(key)) return "Gemini";
+    if (/^sk-or-v1-/i.test(key)) return "OpenRouter";
+    if (/^gsk_/i.test(key)) return "Groq";
+    if (/^sk-(proj-)?/i.test(key)) return "OpenAI";
+    return "";
+  }
+
+  function handleModelKeyChange(value: string) {
+    const detected = detectProviderFromKey(value);
+    if (detected) {
+      const preset = MODEL_PRESETS[detected];
+      setModelForm((prev) => ({ ...prev, provider: detected, name: detected, ...preset, apiKey: value } as ModelConnection));
+      setKeyError("");
+      addActivityLog("info", `Detected ${detected} API key; filled the compatible connection settings.`);
+      return;
+    }
+    setModelForm((prev) => ({ ...prev, apiKey: value }));
+    setKeyError("");
+  }
+
   function clearActive() { setChats(prev => prev.map(c => c.id === active.id ? { ...c, messages: [], title: "New conversation", updatedAt: Date.now() } : c)); setDraft(""); setAttachedName(""); setAttachedText(""); }
   function exportActive() { const text = `# ${active.title}\n\n` + active.messages.map(m => `## ${m.role === "user" ? "You" : "KChat"}\n\n${m.content}`).join("\n\n"); const blob = new Blob([text], { type: "text/markdown" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `${active.title.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "kchat"}.md`; a.click(); URL.revokeObjectURL(url); }
   async function attach(file?: File) { if (!file) return; const ok = file.type.startsWith("text/") || /\.(txt|md|json|csv|js|jsx|ts|tsx|py|java|c|cpp|html|css|sql|xml|yaml|yml|sh|log)$/i.test(file.name); if (!ok) { setError("KChat currently accepts text and code files. PDF/image attachments can be added with the storage backend."); return; } if (file.size > 250000) { setError("Keep text attachments under 250 KB for browser-only mode."); return; } setAttachedName(file.name); setAttachedText(await file.text()); setError(""); }
@@ -851,9 +873,9 @@ export default function Home() {
           <label className="field"><span>Provider</span><select value={modelForm.provider} onChange={(e) => startModelPreset(e.target.value)}><option>OpenAI</option><option>Gemini</option><option>OpenRouter</option><option>Groq</option><option>Mistral</option><option>Custom</option></select></label>
           <div className="form-grid"><label className="field"><span>Connection name</span><input value={modelForm.name} onChange={(e) => setModelForm({...modelForm,name:e.target.value})} placeholder="My Gemini" /></label><label className="field"><span>Model ID</span><input value={modelForm.model} onChange={(e) => setModelForm({...modelForm,model:e.target.value})} placeholder="gemini-3.8-flash" /></label></div>
           <label className="field"><span>API base URL</span><input value={modelForm.baseUrl} onChange={(e) => setModelForm({...modelForm,baseUrl:e.target.value})} placeholder="https://.../v1" /></label>
-          <div className="form-grid"><label className="field"><span>API key</span><input autoFocus type="password" value={modelForm.apiKey} onChange={(e) => { setModelForm({...modelForm,apiKey:e.target.value}); setKeyError(""); }} placeholder="Paste any provider key" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label><label className="field"><span>Auth header</span><input value={modelForm.authHeader} onChange={(e) => setModelForm({...modelForm,authHeader:e.target.value})} placeholder="Authorization" /></label></div>
+          <div className="form-grid"><label className="field"><span>API key <em className="field-hint">paste first — provider is detected automatically</em></span><input autoFocus type="password" value={modelForm.apiKey} onChange={(e) => handleModelKeyChange(e.target.value)} placeholder="Paste your API key" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label><label className="field"><span>Auth header</span><input value={modelForm.authHeader} onChange={(e) => setModelForm({...modelForm,authHeader:e.target.value})} placeholder="Authorization" /></label></div>
           <div className="form-grid"><label className="field"><span>Auth prefix</span><input value={modelForm.authPrefix} onChange={(e) => setModelForm({...modelForm,authPrefix:e.target.value})} placeholder="Bearer" /></label><label className="field"><span>API protocol</span><select value={modelForm.protocol} onChange={(e) => setModelForm({...modelForm,protocol:e.target.value as ModelConnection["protocol"]})}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label></div>
-          <div className="security-note"><KeyRound size={14} /><span>Supports Gemini, OpenAI, OpenRouter, Groq, Mistral and custom OpenAI-compatible endpoints. Google AQ.* Gemini keys are detected automatically. A native provider API that is not OpenAI-compatible needs a dedicated adapter.</span></div>{keyError && <div className="key-error" role="alert">{keyError}</div>}
+          <div className="security-note"><KeyRound size={14} /><span><strong>Quick connect:</strong> paste an OpenAI, Gemini, OpenRouter, or Groq key and KChat automatically fills the provider, endpoint, model, and protocol. You can still edit the advanced fields below. A native provider API that is not OpenAI-compatible needs a dedicated adapter.</span></div>{keyError && <div className="key-error" role="alert">{keyError}</div>}
           <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey} disabled={keyTesting}>{keyTesting ? "Testing connection…" : "Test & connect"}</button></div>
         </Modal>
       )}
