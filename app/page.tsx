@@ -14,6 +14,7 @@ import {
   MoreHorizontal,
   PanelLeft,
   Paperclip,
+  Pencil,
   Plus,
   Search,
   Settings2,
@@ -101,6 +102,7 @@ export default function Home() {
   const [netlifyToken, setNetlifyToken] = useState("");
   const [integrationStatus, setIntegrationStatus] = useState<{ github: string; netlify: string }>({ github: "", netlify: "" });
   const [chatSettingsId, setChatSettingsId] = useState<string | null>(null);
+  const [contextModeOpen, setContextModeOpen] = useState(false);
   const [attachedName, setAttachedName] = useState("");
   const [attachedText, setAttachedText] = useState("");
   const [gridOpen, setGridOpen] = useState(false);
@@ -394,6 +396,29 @@ export default function Home() {
     } catch {}
   }
 
+  function editPrompt(messageId: string) {
+    const index = active.messages.findIndex((message) => message.id === messageId);
+    if (index < 0) return;
+    const message = active.messages[index];
+    if (message.role !== "user") return;
+    stop(active.id);
+    updateActive(active.messages.slice(0, index), index === 0 ? "New conversation" : active.title);
+    setDraft(message.content);
+    setError("");
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }
+
+  function improvisePrompt(text: string) {
+    const chat = makeChat();
+    chat.title = "Improvise prompt";
+    setChats((prev) => [chat, ...prev]);
+    setActiveId(chat.id);
+    setDraft(`Improve and strengthen this prompt while preserving my original intent. Return a polished version I can use directly.\n\n${text}`);
+    setError("");
+    setMobileOpen(false);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }
+
   return (
     <main className={`app ${dark ? "dark" : "light"}`}>
       <div className="ambient ambient-one" />
@@ -539,9 +564,11 @@ export default function Home() {
                   {message.role === "assistant" && <div className="assistant-badge"><Sparkles size={14} /></div>}
                   <div className="message-body">
                     {message.role === "user" ? <div className="user-bubble">{message.content}</div> : <div className="assistant-text">{message.content || <span className="thinking"><i /><i /><i /></span>}</div>}
-                    {message.role === "assistant" && message.content && (
-                      <div className="message-actions">
-                        <button onClick={() => copy(message.content, message.id)}>{copied === message.id ? <Check size={13} /> : <Copy size={13} />} {copied === message.id ? "Copied" : "Copy"}</button>
+                    {message.content && (
+                      <div className={`message-actions ${message.role === "user" ? "user-message-actions" : ""}`}>
+                        {message.role === "user" && <button title="Edit prompt" onClick={() => editPrompt(message.id)}><Pencil size={13} /> <span>Edit</span></button>}
+                        <button title="Copy" onClick={() => copy(message.content, message.id)}>{copied === message.id ? <Check size={13} /> : <Copy size={13} />} <span>{copied === message.id ? "Copied" : "Copy"}</span></button>
+                        {message.role === "user" && <button title="Improvise this prompt in another chat" onClick={() => improvisePrompt(message.content)}><Sparkles size={13} /> <span>Improvise</span></button>}
                       </div>
                     )}
                   </div>
@@ -578,7 +605,18 @@ export default function Home() {
         if (!target) return null;
         return <Modal title="Conversation context" icon={<Settings2 size={17} />} onClose={() => setChatSettingsId(null)}>
           <div className="modal-intro"><div className="intro-glow"><MessageCircle size={20}/></div><div><strong>Control what this chat can see</strong><p>Context is local to your browser. Isolated chats receive only their own history.</p></div></div>
-          <label className="field"><span>Context mode</span><select value={target.contextMode} onChange={(e) => setChats(prev => prev.map(c => c.id === target.id ? { ...c, contextMode: e.target.value as ContextMode } : c))}><option value="isolated">Isolated — this chat only</option><option value="connected">Connected — selected chats</option><option value="global">Global — all other chats</option></select></label>
+          <label className="field context-mode-field"><span>Context mode</span>
+             <button type="button" className={`context-mode-trigger ${contextModeOpen ? "open" : ""}`} onClick={() => setContextModeOpen((value) => !value)} aria-expanded={contextModeOpen}>
+               <span className={`context-mode-icon ${target.contextMode}`}><MessageCircle size={14}/></span>
+               <span className="context-mode-trigger-copy"><strong>{target.contextMode === "isolated" ? "Isolated" : target.contextMode === "connected" ? "Connected" : "Global"}</strong><small>{target.contextMode === "isolated" ? "Only this conversation" : target.contextMode === "connected" ? `${target.connectedChats.length} selected conversation${target.connectedChats.length === 1 ? "" : "s"}` : "All other conversations"}</small></span>
+               <ChevronDown size={15} className="context-mode-chevron"/>
+             </button>
+             {contextModeOpen && <div className="context-mode-options">
+               {[{ id: "isolated" as ContextMode, title: "Isolated", description: "Only this conversation" }, { id: "connected" as ContextMode, title: "Connected", description: "Choose which conversations are visible" }, { id: "global" as ContextMode, title: "Global", description: "Allow context from every other conversation" }].map((option) => <button type="button" key={option.id} className={`context-mode-option ${target.contextMode === option.id ? "selected" : ""}`} onClick={() => { setChats(prev => prev.map(c => c.id === target.id ? { ...c, contextMode: option.id } : c)); setContextModeOpen(false); }}>
+                 <span className={`context-mode-icon ${option.id}`}><MessageCircle size={14}/></span><span><strong>{option.title}</strong><small>{option.description}</small></span>{target.contextMode === option.id && <Check size={15}/>}
+               </button>)}
+             </div>}
+           </label>
           {target.contextMode === "connected" && <label className="field"><span>Connected conversations</span><div className="chat-picker">{chats.filter(c => c.id !== target.id).map(c => <label key={c.id}><input type="checkbox" checked={target.connectedChats.includes(c.id)} onChange={(e) => setChats(prev => prev.map(x => x.id === target.id ? { ...x, connectedChats: e.target.checked ? [...x.connectedChats, c.id] : x.connectedChats.filter(id => id !== c.id) } : x))}/><span>{c.title}</span></label>)}</div></label>}
           <div className="security-note"><Sparkles size={14}/><span>Only recent messages from permitted chats are injected as context when you generate.</span></div>
           <div className="modal-actions"><button className="primary" onClick={() => setChatSettingsId(null)}>Done</button></div>
