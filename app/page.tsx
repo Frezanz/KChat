@@ -58,7 +58,7 @@ const DEFAULT_SETTINGS: Settings = {
 
 const MODEL_PRESETS: Record<string, Partial<ModelConnection>> = {
   OpenAI: { baseUrl: "https://api.openai.com/v1", protocol: "responses", model: "gpt-5.6-luna", authHeader: "Authorization", authPrefix: "Bearer" },
-  Gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", protocol: "chat", model: "gemini-3.8-flash", authHeader: "Authorization", authPrefix: "Bearer" },
+  Gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/", protocol: "chat", model: "gemini-3.8-flash", authHeader: "Authorization", authPrefix: "Bearer" },
   OpenRouter: { baseUrl: "https://openrouter.ai/api/v1", protocol: "chat", model: "openai/gpt-5.4-pro", authHeader: "Authorization", authPrefix: "Bearer" },
   Groq: { baseUrl: "https://api.groq.com/openai/v1", protocol: "responses", model: "openai/gpt-oss-120b", authHeader: "Authorization", authPrefix: "Bearer" },
   Mistral: { baseUrl: "https://api.mistral.ai/v1", protocol: "chat", model: "mistral-large-latest", authHeader: "Authorization", authPrefix: "Bearer" },
@@ -74,7 +74,20 @@ function modelEndpoint(connection: ModelConnection) {
 function modelHeaders(connection: ModelConnection) {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (connection.apiKey) headers[connection.authHeader || "Authorization"] = connection.authPrefix ? `${connection.authPrefix} ${connection.apiKey}` : connection.apiKey;
+  if (connection.provider.toLowerCase() === "gemini") {
+    headers["x-goog-api-client"] = "kchat/1.0.0";
+  }
   return headers;
+}
+
+async function modelError(response: Response) {
+  const text = await response.text();
+  try {
+    const data = JSON.parse(text);
+    const message = data?.error?.message || data?.message || data?.error;
+    if (typeof message === "string" && message.trim()) return message;
+  } catch {}
+  return text.trim() || `Request failed (${response.status})`;
 }
 
 const starters = [
@@ -302,7 +315,7 @@ export default function Home() {
       method: "POST", signal: controller.signal, headers: modelHeaders(activeModel),
       body: JSON.stringify({ model: activeModel.model, messages: [{ role: "system", content: settings.system }, ...contextMessages(chat, history), user], temperature: settings.temperature, stream: true }),
     });
-    if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+    if (!response.ok) throw new Error(await modelError(response));
     if (!response.body) throw new Error("The model returned no stream.");
     const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "", answer = "";
     while (true) {
@@ -311,7 +324,8 @@ export default function Home() {
       for (const event of events) {
         const line = event.split("\n").find((item) => item.startsWith("data:")); if (!line) continue;
         const raw = line.slice(5).trim(); if (!raw || raw === "[DONE]") continue;
-        const data = JSON.parse(raw) as { choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>; error?: { message?: string } };
+        let data: { choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>; error?: { message?: string } };
+        try { data = JSON.parse(raw); } catch { continue; }
         const delta = data.choices?.[0]?.delta?.content || data.choices?.[0]?.message?.content || "";
         if (delta) answer += delta;
         if (data.error) throw new Error(data.error.message || "Model error");
@@ -331,7 +345,7 @@ export default function Home() {
       let messages: any[] = [{ role: "system", content: settings.system }, ...contextMessages(chat, history), user];
       for (let round = 0; round < 8; round += 1) {
         const response = await fetch(modelEndpoint(activeModel), { method: "POST", signal: controller.signal, headers: modelHeaders(activeModel), body: JSON.stringify({ model: activeModel.model, messages, temperature: settings.temperature, ...(tools.length ? { tools, tool_choice: "auto" } : {}) }) });
-        if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+        if (!response.ok) throw new Error(await modelError(response));
         const data = await response.json(); const message = data.choices?.[0]?.message;
         if (!message) throw new Error("The model returned an empty response.");
         if (!message.tool_calls?.length) return message.content || "The model returned an empty response.";
@@ -353,7 +367,7 @@ export default function Home() {
       const body: Record<string, unknown> = { model: activeModel.model, instructions: settings.system, input, temperature: settings.temperature, stream: false, parallel_tool_calls: false, ...(tools.length ? { tools } : {}) };
       if (previousResponseId) body.previous_response_id = previousResponseId;
       const response = await fetch(modelEndpoint(activeModel), { method: "POST", signal: controller.signal, headers: modelHeaders(activeModel), body: JSON.stringify(body) });
-      if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+      if (!response.ok) throw new Error(await modelError(response));
       const data = await response.json();
       const approval = (data.output || []).find((item: any) => item.type === "mcp_approval_request");
       if (approval) throw new Error(`MCP ${approval.server_label || "server"} requested approval. Change its approval setting to Allow automatically or add an approval flow.`);
