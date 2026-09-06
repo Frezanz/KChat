@@ -88,6 +88,7 @@ export default function Home() {
   const [collapsed, setCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [keyOpen, setKeyOpen] = useState(false);
+  const [keyError, setKeyError] = useState("");
   const [dark, setDark] = useState(true);
   const [sending, setSending] = useState<Record<string, boolean>>({});
   const [error, setError] = useState("");
@@ -367,7 +368,9 @@ export default function Home() {
 
   function saveKey() {
     const value = apiKey.trim();
-    if (!value) return;
+    if (!value) { setKeyError("Paste your OpenAI API key first."); return; }
+    if (!/^sk-[A-Za-z0-9._-]+$/.test(value)) { setKeyError("That does not look like an OpenAI API key. Keys normally start with sk-."); return; }
+    setKeyError("");
     sessionStorage.setItem(KEY, value);
     setApiKey(value);
     setKeyOpen(false);
@@ -580,8 +583,8 @@ export default function Home() {
       {keyOpen && (
         <Modal title="Connect your model" icon={<KeyRound size={17} />} onClose={() => setKeyOpen(false)}>
           <div className="modal-intro"><div className="intro-glow"><KeyRound size={20} /></div><div><strong>Bring your own key</strong><p>Your key stays in this browser session and is sent directly to the API. KChat never sends it to its own server.</p></div></div>
-          <label className="field"><span>OpenAI API key</span><input autoFocus type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label>
-          <div className="security-note"><KeyRound size={14} /><span>Never paste a key into GitHub, screenshots, or source code.</span></div>
+          <label className="field"><span>OpenAI API key</span><input autoFocus type="password" value={apiKey} onChange={(e) => { setApiKey(e.target.value); setKeyError(""); }} placeholder="sk-…" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label>
+          <div className="security-note"><KeyRound size={14} /><span>Never paste a key into GitHub, screenshots, or source code.</span></div>{keyError && <div className="key-error" role="alert">{keyError}</div>}
           <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey}>Connect key</button></div>
         </Modal>
       )}
@@ -618,5 +621,13 @@ function ChatTile({ chat, sending, draft, onDraft, onSend, onStop, onExpand, onC
 }
 
 function Modal({ title, icon, children, onClose }: { title: string; icon: React.ReactNode; children: React.ReactNode; onClose: () => void }) {
-  return <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}><div className="modal"><div className="modal-head"><div className="modal-title"><span>{icon}</span><strong>{title}</strong></div><button className="icon-btn" onClick={onClose}><X size={18} /></button></div>{children}</div></div>;
+  useEffect(() => {
+    window.history.pushState({ kchatModal: true }, "", window.location.href);
+    const handleBack = () => onClose();
+    window.addEventListener("popstate", handleBack);
+    return () => window.removeEventListener("popstate", handleBack);
+  }, []);
+
+  const close = () => { onClose(); window.history.back(); };
+  return <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) close(); }}><div className="modal"><div className="modal-head"><div className="modal-title"><span>{icon}</span><strong>{title}</strong></div><button className="icon-btn" onClick={close}><X size={18} /></button></div>{children}</div></div>;
 }
