@@ -510,129 +510,112 @@ export default function Home() {
     const fakeChat: Chat = { id: "agent-runtime", title: agent.name, messages: [], updatedAt: Date.now(), contextMode: "isolated", connectedChats: [], connectionIds: [] };
     let sandbox = sandboxId || sessionStorage.getItem("kchat-e2b-sandbox-id") || "";
     const transcript: string[] = [];
-    const maxSteps = 8;
+    const maxSteps = 10;
+    const hasConnector = agent.tools.some(tool => ["GitHub", "Netlify", "API tools"].includes(tool));
+
     if (agent.tools.includes("Code runtime")) {
       if (!sandbox) {
         const r = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "create" }) });
         const d = await r.json();
         if (!r.ok) throw new Error(d.error || "Could not create E2B sandbox");
-        sandbox = String(d.sandboxId); sessionStorage.setItem("kchat-e2b-sandbox-id", sandbox); setSandboxId(sandbox); setRuntimeStatus("ready");
+        sandbox = String(d.sandboxId);
+        sessionStorage.setItem("kchat-e2b-sandbox-id", sandbox);
+        setSandboxId(sandbox);
+        setRuntimeStatus("ready");
         transcript.push(`sandbox created: ${sandbox.slice(0, 10)}…`);
       }
     }
+
+    const customApis = connections.filter((connection): connection is ApiConnection => connection.kind === "api");
+    const enabledConnectorTools = [
+      ...(agent.tools.includes("GitHub") ? ["github_list_repositories", "github_read_file", "github_write_file", "github_create_branch", "github_create_pull_request"] : []),
+      ...(agent.tools.includes("Netlify") ? ["netlify_list_sites", "netlify_get_site", "netlify_list_deploys", "netlify_get_deploy", "netlify_trigger_build"] : []),
+      ...(agent.tools.includes("API tools") ? customApis.map(connection => `custom_api:${connection.id}`) : []),
+    ];
+
+    async function executeAgentConnector(action: any) {
+      const tool = String(action.tool || "");
+      if (!tool) throw new Error("external_tool requires a tool name.");
+      const args = action.args && typeof action.args === "object" ? action.args : {};
+      const destructive = tool.includes("write") || tool.includes("create_branch") || tool.includes("create_pull_request") || tool.includes("trigger_build");
+      if (destructive && agent.approval !== "never") {
+        throw new Error(`Approval required for ${tool}. Set this agent's approval policy to Never ask, or run the action from an interactive approval flow.`);
+      }
+
+      if (tool.startsWith("custom_api:")) {
+        const connection = customApis.find(item => item.id === tool.slice("custom_api:".length));
+        if (!connection) throw new Error("The selected API connection is no longer available.");
+        const result = await executeApiConnection(connection, args, controller.signal);
+        transcript.push(`API ${connection.name}:\n${JSON.stringify(result).slice(0, 12000)}`);
+        return result;
+      }
+
+      if (tool.startsWith("github_") || tool.startsWith("netlify_")) {
+        const github = sessionStorage.getItem("kchat-github-token") || "";
+        const netlify = sessionStorage.getItem("kchat-netlify-token") || "";
+        const credentials = tool.startsWith("github_") ? { githubToken: github } : { netlifyToken: netlify };
+        const response = await fetch("/api/tools/execute", {
+          method: "POST",
+          signal: controller.signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tool, args, credentials }),
+        });
+        const data = await response.json().catch(() => ({ error: "Invalid connector response." }));
+        if (!response.ok) throw new Error(data?.error || `${tool} failed (${response.status})`);
+        transcript.push(`${tool}:\n${JSON.stringify(data).slice(0, 12000)}`);
+        return data;
+      }
+      throw new Error(`Unsupported external tool: ${tool}`);
+    }
+
     let task = prompt.trim();
     for (let step = 1; step <= maxSteps; step++) {
-      const instruction = `${agent.instructions}\n\nYou are operating as an autonomous coding agent. Step ${step}/${maxSteps}.\nAvailable tools: ${agent.tools.join(", ") || "none"}.\n${agent.tools.includes("Code runtime") ? "E2B runtime is available. You may read/write files and run shell commands." : "No code runtime is available."}\nReturn ONLY one JSON object with this shape: {"action":"read_file|write_file|run_command|list_files|search_files|git_status|git_diff|done","path":"...","content":"...","command":"...","message":"..."}.\nUse read_file before editing when useful. Use write_file for complete file content. Use run_command for tests/builds. When the task is complete, return action=done.\n\nTask: ${task}\n\nPrevious tool results:\n${transcript.slice(-6).join("\n")}`;
+      const instruction = `${agent.instructions}\n\nYou are operating as an autonomous coding/product agent. Step ${step}/${maxSteps}.\nAvailable configured tools: ${agent.tools.join(", ") || "none"}.\n${agent.tools.includes("Code runtime") ? "E2B runtime is available. You may inspect, edit and run the workspace." : "No code runtime is available."}\n${hasConnector ? `External connector tools available: ${enabledConnectorTools.join(", ")}. For custom APIs use tool=custom_api:<connectionId>.` : "No external connectors are enabled."}\n${agent.tools.includes("Remote MCP") ? "Remote MCP is configured for normal KChat Responses requests, but this bounded JSON agent loop cannot directly approve MCP calls." : ""}\nReturn ONLY one JSON object with this shape: {"action":"read_file|write_file|run_command|list_files|search_files|git_status|git_diff|external_tool|done","path":"...","content":"...","command":"...","query":"...","tool":"...","args":{},"message":"..."}.\nUse read_file before editing when useful. Use write_file for complete file content. Use run_command for tests/builds. Use external_tool for GitHub, Netlify or configured API actions. When the task is complete, return action=done.\n\nTask: ${task}\n\nPrevious tool results:\n${transcript.slice(-8).join("\n")}`;
       const reply = await requestChatCompletion(fakeChat, [], { id: `agent-${step}`, role: "user", content: instruction }, controller, model);
       const match = reply.match(/\{[\s\S]*\}/);
       if (!match) { transcript.push(`agent: ${reply.slice(0, 1000)}`); break; }
       let action: any;
       try { action = JSON.parse(match[0]); } catch { transcript.push(`invalid agent JSON: ${reply.slice(0, 500)}`); break; }
       if (action.action === "done") { transcript.push(`done: ${String(action.message || "Task completed")}`); break; }
-      if (!sandbox && ["read_file", "write_file", "run_command"].includes(action.action)) throw new Error("Code runtime is not available for this agent.");
-      if (action.action === "list_files") {
+      if (action.action === "external_tool") {
+        await executeAgentConnector(action);
+      } else if (!sandbox && ["read_file", "write_file", "run_command", "list_files", "search_files", "git_status", "git_diff"].includes(action.action)) {
+        throw new Error("Code runtime is not available for this agent.");
+      } else if (action.action === "list_files") {
         const r = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "run", sandboxId: sandbox, command: "find . -maxdepth 3 -type f -not -path './.git/*' | sort | head -300", timeoutMs: 30000 }) });
-        const d = await r.json(); if (!r.ok) throw new Error(d.error || "list_files failed"); transcript.push(`files:\n${String(d.stdout || "").slice(0, 12000)}`);
+        const d = await r.json(); if (!r.ok) throw new Error(d.error || "list_files failed");
+        transcript.push(`files:\n${String(d.stdout || "").slice(0, 12000)}`);
       } else if (action.action === "search_files") {
         const q = String(action.query || action.pattern || "").replace(/[^\w ._@/-]/g, "").trim();
         if (!q) throw new Error("search_files requires a query");
         const r = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "run", sandboxId: sandbox, command: `grep -RIn --exclude-dir=.git --exclude-dir=node_modules -- ${JSON.stringify(q)} . | head -100`, timeoutMs: 30000 }) });
-        const d = await r.json(); if (!r.ok) throw new Error(d.error || "search_files failed"); transcript.push(`search ${q}:\n${String(d.stdout || d.stderr || "No matches").slice(0, 12000)}`);
+        const d = await r.json(); if (!r.ok) throw new Error(d.error || "search_files failed");
+        transcript.push(`search ${q}:\n${String(d.stdout || d.stderr || "No matches").slice(0, 12000)}`);
       } else if (action.action === "git_status") {
         const r = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "run", sandboxId: sandbox, command: "git status --short --branch", timeoutMs: 30000 }) });
-        const d = await r.json(); if (!r.ok) throw new Error(d.error || "git_status failed"); transcript.push(`git status:\n${String(d.stdout || d.stderr || "").slice(0, 8000)}`);
+        const d = await r.json(); if (!r.ok) throw new Error(d.error || "git_status failed");
+        transcript.push(`git status:\n${String(d.stdout || d.stderr || "").slice(0, 8000)}`);
       } else if (action.action === "git_diff") {
         const r = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "run", sandboxId: sandbox, command: "git diff --stat && git diff -- . ':!node_modules' | head -20000", timeoutMs: 30000 }) });
-        const d = await r.json(); if (!r.ok) throw new Error(d.error || "git_diff failed"); transcript.push(`git diff:\n${String(d.stdout || d.stderr || "").slice(0, 20000)}`);
+        const d = await r.json(); if (!r.ok) throw new Error(d.error || "git_diff failed");
+        transcript.push(`git diff:\n${String(d.stdout || d.stderr || "").slice(0, 20000)}`);
       } else if (action.action === "read_file") {
         const r = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "read", sandboxId: sandbox, path: String(action.path || "") }) });
         const d = await r.json(); if (!r.ok) throw new Error(d.error || "read_file failed");
-        transcript.push(`read ${action.path}:\n${String(d.content || "").slice(0, 8000)}`);
+        transcript.push(`read ${action.path}:\n${String(d.content || "").slice(0, 10000)}`);
       } else if (action.action === "write_file") {
-        if (agent.approval === "always") throw new Error("This agent requires approval before file writes. Run it from the interactive approval flow.");
+        if (agent.approval !== "never") throw new Error("Approval required for file writes. Set this agent's approval policy to Never ask, or use an interactive approval flow.");
         const r = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "write", sandboxId: sandbox, path: String(action.path || ""), content: String(action.content || "") }) });
         const d = await r.json(); if (!r.ok) throw new Error(d.error || "write_file failed"); transcript.push(`wrote ${action.path}`);
       } else if (action.action === "run_command") {
         const r = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "run", sandboxId: sandbox, command: String(action.command || ""), timeoutMs: 120000 }) });
         const d = await r.json(); if (!r.ok) throw new Error(d.error || "run_command failed"); transcript.push(`$ ${action.command}\n${String(d.stdout || "")}\n${String(d.stderr || "")}\nexit ${d.exitCode ?? 0}`);
-      } else { transcript.push(`unknown action: ${String(action.action)}`); break; }
-      task = "Continue the original task using the latest tool result. Inspect failures and fix them before declaring done.";
-    }
-    return transcript.join("\n\n");
-  }
-
-  async function requestChatCompletion(chat: Chat, history: Message[], user: Message, controller: AbortController, model: ModelConnection) {
-    const response = await fetch(modelEndpoint(model), {
-      method: "POST", signal: controller.signal, headers: modelHeaders(model),
-      body: JSON.stringify({ model: model.model, messages: [{ role: "system", content: settings.system }, ...contextMessages(chat, history), user], temperature: settings.temperature, max_tokens: settings.maxOutputTokens, stream: true }),
-    });
-    if (!response.ok) throw new Error(await modelError(response));
-    if (!response.body) throw new Error("The model returned no stream.");
-    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "", answer = "";
-    while (true) {
-      const { done, value: chunk } = await reader.read(); if (done) break;
-      buffer += decoder.decode(chunk, { stream: true }); const events = buffer.split("\n\n"); buffer = events.pop() || "";
-      for (const event of events) {
-        const line = event.split("\n").find((item) => item.startsWith("data:")); if (!line) continue;
-        const raw = line.slice(5).trim(); if (!raw || raw === "[DONE]") continue;
-        let data: { choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>; error?: { message?: string } };
-        try { data = JSON.parse(raw); } catch { continue; }
-        const delta = data.choices?.[0]?.delta?.content || data.choices?.[0]?.message?.content || "";
-        if (delta) answer += delta;
-        if (data.error) throw new Error(data.error.message || "Model error");
+      } else {
+        transcript.push(`unknown action: ${String(action.action)}`);
       }
-      if (answer) updateChatById(chat.id, [...history, user, { id: "streaming", role: "assistant", content: repairMojibake(answer) }], history.length ? chat.title : user.content.slice(0, 44));
+      task = "Continue from the latest tool result. Inspect before changing anything, verify changes with tests or diffs, and finish only when the original task is satisfied.";
     }
-    return repairMojibake(answer) || "The model returned an empty response.";
-  }
-
-  async function requestWithTools(chat: Chat, history: Message[], user: Message, controller: AbortController, model: ModelConnection) {
-    const attached = attachedConnections(chat);
-    const hasMcp = attached.some((item) => item.kind === "mcp");
-    if (hasMcp && model.protocol !== "responses") throw new Error("This model connection uses Chat Completions. Use a Responses-compatible provider to attach remote MCP servers.");
-    if (!hasMcp && model.protocol === "chat") {
-      const tools = attached.filter((item): item is ApiConnection => item.kind === "api").map((connection) => ({ type: "function", function: { name: toolName(connection), description: connection.description || `Call the ${connection.name} API.`, parameters: connection.inputSchema } }));
-      let messages: any[] = [{ role: "system", content: settings.system }, ...contextMessages(chat, history), user];
-      for (let round = 0; round < 8; round += 1) {
-        const response = await fetch(modelEndpoint(model), { method: "POST", signal: controller.signal, headers: modelHeaders(model), body: JSON.stringify({ model: model.model, messages, temperature: settings.temperature, max_tokens: settings.maxOutputTokens, ...(tools.length ? { tools, tool_choice: "auto" } : {}) }) });
-        if (!response.ok) throw new Error(await modelError(response));
-        const data = await response.json(); const message = data.choices?.[0]?.message;
-        if (!message) throw new Error("The model returned an empty response.");
-        if (!message.tool_calls?.length) return repairMojibake(message.content || "") || "The model returned an empty response.";
-        messages.push(message);
-        for (const call of message.tool_calls) {
-          const connection = attached.find((item) => item.kind === "api" && toolName(item) === call.function?.name) as ApiConnection | undefined;
-          let result: unknown;
-          try { result = connection ? await executeApiConnection(connection, JSON.parse(call.function?.arguments || "{}"), controller.signal) : { error: "API connection is no longer attached." }; }
-          catch (error) { result = { error: (error as Error).message }; }
-          messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result).slice(0, 50000) });
-        }
-      }
-      throw new Error("Tool loop exceeded the 8-call safety limit.");
-    }
-    const tools = buildTools(chat);
-    const input: any[] = [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content }));
-    let previousResponseId: string | undefined;
-    for (let round = 0; round < 8; round += 1) {
-      const body: Record<string, unknown> = { model: model.model, instructions: settings.system, input, temperature: settings.temperature, max_output_tokens: settings.maxOutputTokens, stream: false, parallel_tool_calls: false, ...(tools.length ? { tools } : {}) };
-      if (previousResponseId) body.previous_response_id = previousResponseId;
-      const response = await fetch(modelEndpoint(model), { method: "POST", signal: controller.signal, headers: modelHeaders(model), body: JSON.stringify(body) });
-      if (!response.ok) throw new Error(await modelError(response));
-      const data = await response.json();
-      const approval = (data.output || []).find((item: any) => item.type === "mcp_approval_request");
-      if (approval) throw new Error(`MCP ${approval.server_label || "server"} requested approval. Change its approval setting to Allow automatically or add an approval flow.`);
-      const calls = (data.output || []).filter((item: any) => item.type === "function_call");
-      if (!calls.length) return repairMojibake(data.output_text || "") || "The model returned an empty response.";
-      previousResponseId = data.id; const outputs: any[] = [];
-      for (const call of calls) {
-        const connection = attachedConnections(chat).find((item) => item.kind === "api" && toolName(item) === call.name) as ApiConnection | undefined;
-        if (!connection) { outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "API connection is no longer attached." }) }); continue; }
-        try { const result = await executeApiConnection(connection, JSON.parse(call.arguments || "{}"), controller.signal); outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(result).slice(0, 50000) }); }
-        catch (error) { outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: (error as Error).message }) }); }
-      }
-      input.splice(0, input.length, ...outputs);
-    }
-    throw new Error("Tool loop exceeded the 8-call safety limit.");
+    return transcript.join("\n\n") || "Agent finished without a transcript.";
   }
 
   async function sendGrid(chatId: string) {
