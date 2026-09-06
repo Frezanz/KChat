@@ -1,9 +1,10 @@
 import { NextResponse } from "next/server";
-import { db } from "../../../../lib/db";
+import { db, ensureDatabaseSchema } from "../../../../lib/db";
 import { createSession, hashPassword } from "../../../../lib/auth";
 
 export async function POST(request: Request) {
   try {
+    await ensureDatabaseSchema();
     const body = await request.json();
     const email = String(body.email ?? "").trim().toLowerCase();
     const password = String(body.password ?? "");
