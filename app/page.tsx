@@ -31,7 +31,8 @@ import {
 
 type Role = "user" | "assistant";
 type Message = { id: string; role: Role; content: string };
-type Chat = { id: string; title: string; messages: Message[]; updatedAt: number };
+type ContextMode = "isolated" | "connected" | "global";
+type Chat = { id: string; title: string; messages: Message[]; updatedAt: number; contextMode: ContextMode; connectedChats: string[] };
 type Settings = { model: string; system: string; temperature: number };
 
 const KEY = "kchat-api-key";
@@ -55,7 +56,7 @@ function uid() {
 }
 
 function makeChat(): Chat {
-  return { id: uid(), title: "New conversation", messages: [], updatedAt: Date.now() };
+  return { id: uid(), title: "New conversation", messages: [], updatedAt: Date.now(), contextMode: "isolated", connectedChats: [] };
 }
 
 function load<T>(key: string, fallback: T): T {
@@ -85,11 +86,12 @@ export default function Home() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [keyOpen, setKeyOpen] = useState(false);
   const [dark, setDark] = useState(true);
-  const [sending, setSending] = useState(false);
+  const [sending, setSending] = useState<Record<string, boolean>>({});
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
   const [moreOpen, setMoreOpen] = useState(false);
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [chatSettingsId, setChatSettingsId] = useState<string | null>(null);
   const [attachedName, setAttachedName] = useState("");
   const [attachedText, setAttachedText] = useState("");
   const [gridOpen, setGridOpen] = useState(false);
@@ -98,11 +100,15 @@ export default function Home() {
   const [gridDrafts, setGridDrafts] = useState<Record<string, string>>({});
   const [gridSending, setGridSending] = useState<Record<string, boolean>>({});
   const gridAbortRef = useRef<Record<string, AbortController | null>>({});
-  const abortRef = useRef<AbortController | null>(null);
+  const abortRef = useRef<Record<string, AbortController | null>>({});
   const endRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setChats(prev => prev.map(chat => ({ ...chat, contextMode: chat.contextMode || "isolated", connectedChats: chat.connectedChats || [] })));
+  }, []);
 
   useEffect(() => {
     if (!activeId && chats[0]) setActiveId(chats[0].id);
@@ -148,6 +154,20 @@ export default function Home() {
       : chat));
   }
 
+  function contextMessages(chat: Chat, history: Message[]) {
+    const sources = chat.contextMode === "global"
+      ? chats.filter((item) => item.id !== chat.id)
+      : chat.contextMode === "connected"
+        ? chats.filter((item) => chat.connectedChats.includes(item.id))
+        : [];
+    if (!sources.length) return history;
+    const context = sources.flatMap((source) => source.messages.slice(-12).map((m) => ({
+      role: m.role,
+      content: `[Context from ${source.title}] ${m.content}`,
+    })));
+    return [...context, ...history];
+  }
+
   async function sendGrid(chatId: string) {
     const value = (gridDrafts[chatId] || "").trim();
     if (!value || gridSending[chatId] || !apiKey) {
@@ -174,7 +194,7 @@ export default function Home() {
         body: JSON.stringify({
           model: settings.model,
           instructions: settings.system,
-          input: [...history, user].map((message) => ({ role: message.role, content: message.content })),
+          input: [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content })),
           temperature: settings.temperature,
           stream: true,
         }),
@@ -262,85 +282,54 @@ export default function Home() {
   async function send(text = draft) {
     let value = text.trim();
     if (attachedText) value += `\n\n[Attached file: ${attachedName}]\n${attachedText}`;
-    if (!value || sending) return;
-    if (!apiKey) {
-      setKeyOpen(true);
-      return;
-    }
-
-    setDraft("");
-    setError("");
-    setSending(true);
+    if (!value) return;
+    if (!apiKey) { setKeyOpen(true); return; }
+    const chat = chats.find((item) => item.id === activeId);
+    if (!chat || sending[chat.id]) return;
+    setDraft(""); setError("");
+    setSending((prev) => ({ ...prev, [chat.id]: true }));
     const user: Message = { id: uid(), role: "user", content: value };
     const assistant: Message = { id: uid(), role: "assistant", content: "" };
-    const history = active.messages;
-    updateActive([...history, user, assistant], history.length ? active.title : value.slice(0, 44));
-
+    const history = chat.messages;
+    const title = history.length ? chat.title : value.slice(0, 44);
+    updateChatById(chat.id, [...history, user, assistant], title);
     const controller = new AbortController();
-    abortRef.current = controller;
-
+    abortRef.current[chat.id] = controller;
     try {
       const response = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        signal: controller.signal,
+        method: "POST", signal: controller.signal,
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify({
-          model: settings.model,
-          instructions: settings.system,
-          input: [...history, user].map((message) => ({ role: message.role, content: message.content })),
-          temperature: settings.temperature,
-          stream: true,
+          model: settings.model, instructions: settings.system,
+          input: [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content })),
+          temperature: settings.temperature, stream: true,
         }),
       });
-
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(body || `Request failed (${response.status})`);
-      }
+      if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
       if (!response.body) throw new Error("The model returned no stream.");
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let answer = "";
-
+      const reader = response.body.getReader(); const decoder = new TextDecoder();
+      let buffer = "", answer = "";
       while (true) {
-        const { done, value: chunk } = await reader.read();
-        if (done) break;
+        const { done, value: chunk } = await reader.read(); if (done) break;
         buffer += decoder.decode(chunk, { stream: true });
-        const events = buffer.split("\n\n");
-        buffer = events.pop() || "";
-
+        const events = buffer.split("\n\n"); buffer = events.pop() || "";
         for (const event of events) {
-          const line = event.split("\n").find((item) => item.startsWith("data:"));
-          if (!line) continue;
-          const raw = line.slice(5).trim();
-          if (!raw || raw === "[DONE]") continue;
+          const line = event.split("\n").find((item) => item.startsWith("data:")); if (!line) continue;
+          const raw = line.slice(5).trim(); if (!raw || raw === "[DONE]") continue;
           const data = JSON.parse(raw) as { type?: string; delta?: string; error?: { message?: string } };
-          if (data.type === "response.output_text.delta") {
-            answer += data.delta || "";
-            updateActive([...history, user, { ...assistant, content: answer }], history.length ? active.title : value.slice(0, 44));
-          }
+          if (data.type === "response.output_text.delta") { answer += data.delta || ""; updateChatById(chat.id, [...history, user, { ...assistant, content: answer }], title); }
           if (data.type === "error") throw new Error(data.error?.message || "Model error");
         }
       }
-
-      if (!answer) updateActive([...history, user, { ...assistant, content: "The model returned an empty response." }]);
+      if (!answer) updateChatById(chat.id, [...history, user, { ...assistant, content: "The model returned an empty response." }], title);
     } catch (e) {
-      if ((e as Error).name !== "AbortError") {
-        setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320));
-        updateActive([...history, user]);
-      }
+      if ((e as Error).name !== "AbortError") { setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320)); updateChatById(chat.id, [...history, user], title); }
     } finally {
-      abortRef.current = null;
-      setSending(false);
+      abortRef.current[chat.id] = null; setSending((prev) => ({ ...prev, [chat.id]: false }));
     }
   }
 
-  function stop() {
-    abortRef.current?.abort();
-    setSending(false);
-  }
+  function stop(chatId = activeId) { abortRef.current[chatId]?.abort(); setSending((prev) => ({ ...prev, [chatId]: false })); }
 
   function saveKey() {
     const value = apiKey.trim();
@@ -486,7 +475,7 @@ export default function Home() {
             </div>
           ) : (
             <div className="messages">
-              <div className="conversation-title"><span>{active.title}</span><i /></div>
+              <div className="conversation-title"><span>{active.title}</span><i /><button className="icon-btn" title="Chat settings" onClick={() => setChatSettingsId(active.id)}><Settings2 size={15}/></button></div>
               {active.messages.map((message) => (
                 <div className={`message-row ${message.role}`} key={message.id}>
                   {message.role === "assistant" && <div className="assistant-badge"><Sparkles size={14} /></div>}
@@ -513,7 +502,7 @@ export default function Home() {
             <textarea ref={textareaRef} value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} placeholder="Message KChat…" rows={1} />
             <div className="composer-bottom">
               <div className="composer-left"><input ref={fileRef} type="file" hidden onChange={e => { attach(e.target.files?.[0]); e.currentTarget.value=""; }}/><button title="Attach file" onClick={() => fileRef.current?.click()}><Paperclip size={17}/></button><div className="tools-wrap"><button title="Quick tools" onClick={() => { setToolsOpen(v=>!v); setMoreOpen(false); }}><Plus size={18}/></button>{toolsOpen && <div className="tools-menu"><button onClick={() => useQuickPrompt("Improve this prompt:")}><Sparkles size={13}/> Improve prompt</button><button onClick={() => useQuickPrompt("Explain this simply:")}><Sparkles size={13}/> Explain simply</button><button onClick={() => useQuickPrompt("Brainstorm 10 strong ideas for:")}><Sparkles size={13}/> Brainstorm</button></div>}</div><span className="composer-model">{settings.model}</span></div>
-              <div className="composer-right"><span className="connection-label"><i />{apiKey ? "Ready" : "API key required"}</span>{sending ? <button className="send-btn stop" onClick={stop}><Square size={13} fill="currentColor" /></button> : <button className="send-btn" onClick={() => send()} disabled={!draft.trim() && !attachedText}><ArrowUp size={17} /></button>}</div>
+              <div className="composer-right"><span className="connection-label"><i />{apiKey ? "Ready" : "API key required"}</span>{sending[active.id] ? <button className="send-btn stop" onClick={() => stop(active.id)}><Square size={13} fill="currentColor" /></button> : <button className="send-btn" onClick={() => send()} disabled={!draft.trim() && !attachedText}><ArrowUp size={17} /></button>}</div>
             </div>
           </div>
           <p className="disclaimer">KChat may make mistakes. Requests are sent directly from your browser using your own API key.</p>
@@ -524,6 +513,18 @@ export default function Home() {
         const chat = chats.find((item) => item.id === fullscreenId);
         if (!chat) return null;
         return <div className="chat-fullscreen"><div className="fullscreen-head"><div><span className="eyebrow-inline"><i /> Focus mode</span><strong>{chat.title}</strong></div><button className="icon-btn" onClick={() => setFullscreenId(null)}><Minimize2 size={17}/></button></div><div className="fullscreen-body">{chat.messages.length ? chat.messages.map((message) => <div className={`message-row ${message.role}`} key={message.id}>{message.role === "assistant" && <div className="assistant-badge"><Sparkles size={14}/></div>}<div className="message-body">{message.role === "user" ? <div className="user-bubble">{message.content}</div> : <div className="assistant-text">{message.content || <span className="thinking"><i/><i/><i/></span>}</div>}</div></div>) : <div className="fullscreen-empty"><Sparkles size={25}/><p>This conversation is ready.</p></div>}</div><div className="fullscreen-composer"><textarea value={gridDrafts[chat.id] || ""} onChange={(e) => setGridDrafts((prev) => ({ ...prev, [chat.id]: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendGrid(chat.id); } }} placeholder="Continue this conversation…" rows={1}/>{gridSending[chat.id] ? <button className="send-btn stop" onClick={() => stopGrid(chat.id)}><Square size={13} fill="currentColor"/></button> : <button className="send-btn" onClick={() => sendGrid(chat.id)} disabled={!gridDrafts[chat.id]?.trim()}><ArrowUp size={17}/></button>}</div></div>;
+      })()}
+
+      {chatSettingsId && (() => {
+        const target = chats.find((item) => item.id === chatSettingsId);
+        if (!target) return null;
+        return <Modal title="Conversation context" icon={<Settings2 size={17} />} onClose={() => setChatSettingsId(null)}>
+          <div className="modal-intro"><div className="intro-glow"><MessageCircle size={20}/></div><div><strong>Control what this chat can see</strong><p>Context is local to your browser. Isolated chats receive only their own history.</p></div></div>
+          <label className="field"><span>Context mode</span><select value={target.contextMode} onChange={(e) => setChats(prev => prev.map(c => c.id === target.id ? { ...c, contextMode: e.target.value as ContextMode } : c))}><option value="isolated">Isolated — this chat only</option><option value="connected">Connected — selected chats</option><option value="global">Global — all other chats</option></select></label>
+          {target.contextMode === "connected" && <label className="field"><span>Connected conversations</span><div className="chat-picker">{chats.filter(c => c.id !== target.id).map(c => <label key={c.id}><input type="checkbox" checked={target.connectedChats.includes(c.id)} onChange={(e) => setChats(prev => prev.map(x => x.id === target.id ? { ...x, connectedChats: e.target.checked ? [...x.connectedChats, c.id] : x.connectedChats.filter(id => id !== c.id) } : x))}/><span>{c.title}</span></label>)}</div></label>}
+          <div className="security-note"><Sparkles size={14}/><span>Only recent messages from permitted chats are injected as context when you generate.</span></div>
+          <div className="modal-actions"><button className="primary" onClick={() => setChatSettingsId(null)}>Done</button></div>
+        </Modal>;
       })()}
 
       {keyOpen && (

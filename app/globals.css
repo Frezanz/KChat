@@ -74,3 +74,11 @@
   .chat-tile { min-height:420px; max-height:none; }
   .fullscreen-body { padding:28px 16px 120px; }
 }
+
+
+/* Conversation context controls */
+.conversation-title{display:flex;align-items:center;gap:10px}.conversation-title .icon-btn{margin-left:auto;width:30px;height:30px}
+.field select{width:100%;border:1px solid var(--line-strong);background:var(--panel-strong);color:var(--text);border-radius:12px;padding:11px 12px;font:inherit;outline:none}
+.chat-picker{display:flex;flex-direction:column;gap:8px;max-height:190px;overflow:auto;padding:4px}
+.chat-picker label{display:flex;align-items:center;gap:10px;padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+.chat-picker input{accent-color:var(--accent)}
