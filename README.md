@@ -1,21 +1,41 @@
-# KChat
+# KChat 2
 
-A minimal, private-by-design AI chat workspace with Bring Your Own API Key.
+A premium, Gemini-inspired personal AI chat workspace rebuilt with **Next.js + TypeScript**.
 
-## Use
+## Stack
 
-1. Install dependencies: `npm install`
-2. Start: `npm run dev`
-3. Open KChat and paste your OpenAI API key in **Settings**.
-4. Set the model ID available to your account (the default is `gpt-6`).
-5. Start chatting.
+- Next.js 16 / App Router
+- React 19
+- TypeScript
+- Lucide icons
+- Custom CSS design system (no UI kit dependency)
 
-## Architecture
+## Features
 
-- React + Vite frontend.
-- Requests go directly from the browser to the OpenAI Responses API.
-- The API key is stored in `sessionStorage`, not in KChat's database or source code.
-- Conversations and model settings are stored locally in the browser.
-- No KChat backend is required for the BYOK flow.
+- Gemini-style spacious AI workspace
+- Premium dark/light visual system
+- Responsive desktop + mobile sidebar
+- Multiple conversations and local history
+- Search conversations
+- Streaming OpenAI Responses API output
+- BYOK API key flow stored in browser session storage
+- Editable model ID, system instructions, and temperature
+- Stop generation, copy responses, starter prompts
+- No KChat backend required
 
-> Important: a browser app cannot make an API key completely secret. Treat a key used in a client-side app as exposed to the browser environment and use a key with appropriate limits/billing controls.
+## Run
+
+```bash
+npm install
+npm run dev
+```
+
+Open the local URL, add your API key, choose a model ID supported by your API account, and start chatting.
+
+## Security
+
+The API key stays in the browser's `sessionStorage` and is sent directly to the selected API endpoint. It is not included in source code or this repository. Browser-side API keys are still not equivalent to a server-side secret, so use appropriate API limits and billing controls.
+
+## Design direction
+
+KChat 2 intentionally avoids copying proprietary assets. The visual language is inspired by modern premium AI products: calm spacing, minimal chrome, soft gradients, elevated composer, restrained borders, and a conversation-first layout.
