@@ -27,6 +27,9 @@ import {
   Maximize2,
   Minimize2,
   LayoutGrid,
+  Plug,
+  Github,
+  Globe2,
 } from "lucide-react";
 
 type Role = "user" | "assistant";
@@ -93,6 +96,10 @@ export default function Home() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [profileUser, setProfileUser] = useState<{ email: string } | null>(null);
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [integrationsOpen, setIntegrationsOpen] = useState(false);
+  const [githubToken, setGithubToken] = useState("");
+  const [netlifyToken, setNetlifyToken] = useState("");
+  const [integrationStatus, setIntegrationStatus] = useState<{ github: string; netlify: string }>({ github: "", netlify: "" });
   const [chatSettingsId, setChatSettingsId] = useState<string | null>(null);
   const [attachedName, setAttachedName] = useState("");
   const [attachedText, setAttachedText] = useState("");
@@ -101,6 +108,10 @@ export default function Home() {
   const [fullscreenId, setFullscreenId] = useState<string | null>(null);
   const [gridDrafts, setGridDrafts] = useState<Record<string, string>>({});
   const [gridSending, setGridSending] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    setGithubToken(sessionStorage.getItem("kchat-github-token") || "");
+    setNetlifyToken(sessionStorage.getItem("kchat-netlify-token") || "");
+  }, []);
   useEffect(() => {
     fetch("/api/auth/me", { cache: "no-store" }).then((response) => response.ok ? response.json() : null).then((data) => { if (data?.user) setProfileUser(data.user); }).catch(() => {});
   }, []);
@@ -336,6 +347,25 @@ export default function Home() {
 
   function stop(chatId = activeId) { abortRef.current[chatId]?.abort(); setSending((prev) => ({ ...prev, [chatId]: false })); }
 
+  function saveIntegrationCredentials() {
+    if (githubToken.trim()) sessionStorage.setItem("kchat-github-token", githubToken.trim()); else sessionStorage.removeItem("kchat-github-token");
+    if (netlifyToken.trim()) sessionStorage.setItem("kchat-netlify-token", netlifyToken.trim()); else sessionStorage.removeItem("kchat-netlify-token");
+    setIntegrationStatus({ github: githubToken.trim() ? "Connected in this session" : "", netlify: netlifyToken.trim() ? "Connected in this session" : "" });
+  }
+
+  async function testIntegration(provider: "github" | "netlify") {
+    const token = provider === "github" ? githubToken.trim() : netlifyToken.trim();
+    if (!token) { setIntegrationStatus((prev) => ({ ...prev, [provider]: "Add a token first" })); return; }
+    try {
+      const tool = provider === "github" ? "github_list_repositories" : "netlify_list_sites";
+      const response = await fetch("/api/tools/execute", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tool, credentials: provider === "github" ? { githubToken: token } : { netlifyToken: token } }) });
+      if (!response.ok) throw new Error((await response.json()).error || "Connection failed");
+      const data = await response.json();
+      setIntegrationStatus((prev) => ({ ...prev, [provider]: `${Array.isArray(data) ? data.length : 0} accessible ${provider === "github" ? "repositories" : "sites"}` }));
+      saveIntegrationCredentials();
+    } catch (error) { setIntegrationStatus((prev) => ({ ...prev, [provider]: error instanceof Error ? error.message : "Connection failed" })); }
+  }
+
   function saveKey() {
     const value = apiKey.trim();
     if (!value) return;
@@ -429,10 +459,10 @@ export default function Home() {
             <button className="mini-avatar profile-trigger" onClick={() => setProfileOpen(v => !v)} aria-label="Profile" title="Profile"><UserRound size={16}/></button>
             {profileOpen && <div className="profile-menu">
               {profileUser ? <>
-                <div className="profile-menu-user"><div className="profile-menu-avatar"><UserRound size={16}/></div><div><strong>{profileUser.email}</strong><span>Signed in</span></div></div>
+                <div className="profile-menu-user"><div className="profile-menu-avatar"><UserRound size={16}/></div><div><strong>{profileUser.email}</strong><span>Signed in</span></div></div><button onClick={() => { setProfileOpen(false); setIntegrationsOpen(true); }}><Plug size={14}/> Connections</button>
                 <button onClick={async () => { await fetch("/api/auth/logout", { method: "POST" }); window.location.reload(); }}><UserRound size={14}/> Sign out</button>
               </> : <>
-                <div className="profile-menu-head"><strong>Welcome to KChat</strong><span>Sign in to sync your workspace.</span></div>
+                <div className="profile-menu-head"><strong>Welcome to KChat</strong><span>Sign in to sync your workspace.</span></div><button onClick={() => { setProfileOpen(false); setIntegrationsOpen(true); }}><Plug size={14}/> Connections</button>
                 <button onClick={() => { window.location.href = "/?auth=login"; }}><UserRound size={14}/> Sign in</button>
                 <button onClick={() => { window.location.href = "/?auth=signup"; }}><UserRound size={14}/> Create account</button>
                 <span className="profile-menu-guest">You can continue as a guest.</span>
@@ -551,6 +581,16 @@ export default function Home() {
           <label className="field"><span>OpenAI API key</span><input autoFocus type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label>
           <div className="security-note"><KeyRound size={14} /><span>Never paste a key into GitHub, screenshots, or source code.</span></div>
           <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey}>Connect key</button></div>
+        </Modal>
+      )}
+
+      {integrationsOpen && (
+        <Modal title="Connections & tools" icon={<Plug size={17} />} onClose={() => setIntegrationsOpen(false)}>
+          <div className="modal-intro"><div className="intro-glow"><Plug size={20}/></div><div><strong>Give KChat tools</strong><p>Connect services for repository editing, deployments and future agent actions. Tokens stay in this browser session.</p></div></div>
+          <div className="integration-card"><div className="integration-head"><div className="integration-icon"><Github size={17}/></div><div><strong>GitHub</strong><span>Read and edit repositories, branches and pull requests.</span></div></div><input type="password" value={githubToken} onChange={(e) => setGithubToken(e.target.value)} placeholder="GitHub token"/><div className="integration-actions"><button className="secondary" onClick={() => { setGithubToken(""); sessionStorage.removeItem("kchat-github-token"); setIntegrationStatus((prev) => ({ ...prev, github: "Disconnected" })); }}>Disconnect</button><button className="primary" onClick={() => testIntegration("github")}>Test & connect</button></div>{integrationStatus.github && <small>{integrationStatus.github}</small>}</div>
+          <div className="integration-card"><div className="integration-head"><div className="integration-icon"><Globe2 size={17}/></div><div><strong>Netlify</strong><span>Inspect projects, deploys and trigger builds.</span></div></div><input type="password" value={netlifyToken} onChange={(e) => setNetlifyToken(e.target.value)} placeholder="Netlify token"/><div className="integration-actions"><button className="secondary" onClick={() => { setNetlifyToken(""); sessionStorage.removeItem("kchat-netlify-token"); setIntegrationStatus((prev) => ({ ...prev, netlify: "Disconnected" })); }}>Disconnect</button><button className="primary" onClick={() => testIntegration("netlify")}>Test & connect</button></div>{integrationStatus.netlify && <small>{integrationStatus.netlify}</small>}</div>
+          <div className="security-note"><Plug size={14}/><span>Write/deploy tools are marked for confirmation. More connectors can use the same tool registry.</span></div>
+          <div className="modal-actions"><button className="primary" onClick={() => { saveIntegrationCredentials(); setIntegrationsOpen(false); }}>Done</button></div>
         </Modal>
       )}
 
