@@ -372,7 +372,7 @@ export async function POST(request: NextRequest) {
         sandboxId,
         "screenshot --filename=/tmp/kchat-browser-artifacts/latest.png",
       );
-      return {
+      return NextResponse.json({
         url,
         snapshot: String(snapshot.stdout || snapshot.stderr || "").slice(
           0,
@@ -385,7 +385,7 @@ export async function POST(request: NextRequest) {
         browserOutput: String(
           openResult.stdout || openResult.stderr || "",
         ).slice(0, 4000),
-      };
+      });
     }
 
     if (
