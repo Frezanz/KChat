@@ -120,6 +120,24 @@ function load<T>(key: string, fallback: T): T {
   }
 }
 
+function repairMojibake(value: string) {
+  return value
+    .replace(/\u00e2\u0080\u0094/g, "—")
+    .replace(/\u00e2\u0080\u0093/g, "–")
+    .replace(/\u00e2\u0080\u0098/g, "‘")
+    .replace(/\u00e2\u0080\u0099/g, "’")
+    .replace(/\u00e2\u0080\u009c/g, "“")
+    .replace(/\u00e2\u0080\u009d/g, "”")
+    .replace(/\u00e2\u0080\xa2/g, "•")
+    .replace(/\u00e2\u0080\xa6/g, "…")
+    .replace(/\u00e2\u008c\x98/g, "⌘")
+    .replace(/\u00e2\x9c\xa6/g, "✦")
+    .replace(/\u00e2\x97\x88/g, "◈")
+    .replace(/\u00e2\x8c\x81/g, "⌁")
+    .replace(/\u00e2\x86\x97/g, "↗")
+    .replace(/\u00c2·/g, "·");
+}
+
 function getKey() {
   if (typeof window === "undefined") return "";
   return sessionStorage.getItem(KEY) || "";
@@ -354,9 +372,9 @@ export default function Home() {
         if (delta) answer += delta;
         if (data.error) throw new Error(data.error.message || "Model error");
       }
-      if (answer) updateChatById(chat.id, [...history, user, { id: "streaming", role: "assistant", content: answer }], history.length ? chat.title : user.content.slice(0, 44));
+      if (answer) updateChatById(chat.id, [...history, user, { id: "streaming", role: "assistant", content: repairMojibake(answer) }], history.length ? chat.title : user.content.slice(0, 44));
     }
-    return answer || "The model returned an empty response.";
+    return repairMojibake(answer) || "The model returned an empty response.";
   }
 
   async function requestWithTools(chat: Chat, history: Message[], user: Message, controller: AbortController, model: ModelConnection) {
@@ -371,7 +389,7 @@ export default function Home() {
         if (!response.ok) throw new Error(await modelError(response));
         const data = await response.json(); const message = data.choices?.[0]?.message;
         if (!message) throw new Error("The model returned an empty response.");
-        if (!message.tool_calls?.length) return message.content || "The model returned an empty response.";
+        if (!message.tool_calls?.length) return repairMojibake(message.content || "") || "The model returned an empty response.";
         messages.push(message);
         for (const call of message.tool_calls) {
           const connection = attached.find((item) => item.kind === "api" && toolName(item) === call.function?.name) as ApiConnection | undefined;
@@ -395,7 +413,7 @@ export default function Home() {
       const approval = (data.output || []).find((item: any) => item.type === "mcp_approval_request");
       if (approval) throw new Error(`MCP ${approval.server_label || "server"} requested approval. Change its approval setting to Allow automatically or add an approval flow.`);
       const calls = (data.output || []).filter((item: any) => item.type === "function_call");
-      if (!calls.length) return data.output_text || "The model returned an empty response.";
+      if (!calls.length) return repairMojibake(data.output_text || "") || "The model returned an empty response.";
       previousResponseId = data.id; const outputs: any[] = [];
       for (const call of calls) {
         const connection = attachedConnections(chat).find((item) => item.kind === "api" && toolName(item) === call.name) as ApiConnection | undefined;
