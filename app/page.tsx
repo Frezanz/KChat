@@ -625,6 +625,16 @@ export default function Home() {
         if (runtimeTool === "git_create_branch" || runtimeTool === "git_push") runtimeArgs.branch = required(args, "branch");
         if (runtimeTool === "git_add") runtimeArgs.paths = Array.isArray(args.paths) ? args.paths : [];
         if (runtimeTool === "git_commit") runtimeArgs.message = required(args, "message");
+        if (runtimeTool === "git_push") {
+          const validationCommand = "if [ -f package.json ]; then if node -e 'const p=require(\"./package.json\"); process.exit(p.scripts?.build?0:1)' >/dev/null 2>&1; then npm run build; elif node -e 'const p=require(\"./package.json\"); process.exit(p.scripts?.test?0:1)' >/dev/null 2>&1; then npm test -- --runInBand; elif node -e 'const p=require(\"./package.json\"); process.exit(p.scripts?.lint?0:1)' >/dev/null 2>&1; then npm run lint; else git diff --check; fi; else git diff --check; fi";
+          const validationResponse = await fetch("/api/runtime", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "run", sandboxId: sandbox, directory: runtimeArgs.directory, command: validationCommand, timeoutMs: 120000 }) });
+          const validation = await validationResponse.json().catch(() => ({ error: "Invalid validation response." }));
+          const validationOutput = `${String(validation.stdout || "")}\n${String(validation.stderr || "")}`.trim();
+          transcript.push(`pre-push validation: ${validation.exitCode === 0 ? "PASS" : "FAIL"}\n${validationOutput.slice(0, 16000)}`);
+          if (!validationResponse.ok || Number(validation.exitCode ?? 1) !== 0) {
+            return { ok: false, blocked: "validation_failed", exitCode: validation.exitCode, output: validationOutput.slice(0, 16000) };
+          }
+        }
         const response = await fetch("/api/runtime", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(runtimeArgs) });
         const data = await response.json().catch(() => ({ error: "Invalid runtime response." }));
         if (!response.ok) throw new Error(data?.error || `${tool} failed (${response.status})`);
@@ -655,7 +665,7 @@ export default function Home() {
 
     let task = prompt.trim();
     for (let step = 1; step <= maxSteps; step++) {
-      const instruction = `${agent.instructions}\n\nYou are operating as an autonomous coding/product agent. Step ${step}/${maxSteps}.\nAvailable configured tools: ${agent.tools.join(", ") || "none"}.\n${agent.tools.includes("Code runtime") ? "E2B runtime is available. You may inspect, edit and run the workspace." : "No code runtime is available."}\n${hasConnector ? `External connector tools available: ${enabledConnectorTools.join(", ")}. For custom APIs use tool=custom_api:<connectionId>. GitHub workflow: import the repository into E2B, create a feature branch, inspect/edit/test, then stage/commit/push only after approval. After a successful e2b_git_push, KChat automatically creates the pull request, polls its CI checks, and can locate a Netlify Deploy Preview when siteId is supplied. Do not create a duplicate pull request and never merge automatically.` : "No external connectors are enabled."}\n${agent.tools.includes("Remote MCP") ? "Remote MCP is configured for normal KChat Responses requests, but this bounded JSON agent loop cannot directly approve MCP calls." : ""}\nReturn ONLY one JSON object with this shape: {"action":"read_file|write_file|run_command|list_files|search_files|git_status|git_diff|external_tool|done","path":"...","content":"...","command":"...","query":"...","tool":"...","args":{},"message":"..."}. For native E2B git operations use external_tool with tool=e2b_git_branch, e2b_git_create_branch, e2b_git_add, e2b_git_commit, or e2b_git_push and pass arguments in args. For a GitHub repository task, prefer importing the repo into E2B first, create a feature branch in E2B, make and test changes there, inspect git diff, then stage/commit/push only after approval.\nUse read_file before editing when useful. Use write_file for complete file content. Use run_command for tests/builds. Use external_tool for GitHub, Netlify or configured API actions. When the task is complete, return action=done.\n\nTask: ${task}\n\nPrevious tool results:\n${transcript.slice(-8).join("\n")}`;
+      const instruction = `${agent.instructions}\n\nYou are operating as an autonomous coding/product agent. Step ${step}/${maxSteps}.\nAvailable configured tools: ${agent.tools.join(", ") || "none"}.\n${agent.tools.includes("Code runtime") ? "E2B runtime is available. You may inspect, edit and run the workspace." : "No code runtime is available."}\n${agent.tools.includes("Code runtime") ? "Before e2b_git_push, KChat automatically runs a pre-push validation (build, otherwise test, otherwise lint, otherwise git diff --check). If validation fails, do not push; inspect the failure, fix the code, and retry validation." : ""}\n${hasConnector ? `External connector tools available: ${enabledConnectorTools.join(", ")}. For custom APIs use tool=custom_api:<connectionId>. GitHub workflow: import the repository into E2B, create a feature branch, inspect/edit/test, then stage/commit/push only after approval. After a successful e2b_git_push, KChat automatically creates the pull request, polls its CI checks, and can locate a Netlify Deploy Preview when siteId is supplied. Do not create a duplicate pull request and never merge automatically.` : "No external connectors are enabled."}\n${agent.tools.includes("Remote MCP") ? "Remote MCP is configured for normal KChat Responses requests, but this bounded JSON agent loop cannot directly approve MCP calls." : ""}\nReturn ONLY one JSON object with this shape: {"action":"read_file|write_file|run_command|list_files|search_files|git_status|git_diff|external_tool|done","path":"...","content":"...","command":"...","query":"...","tool":"...","args":{},"message":"..."}. For native E2B git operations use external_tool with tool=e2b_git_branch, e2b_git_create_branch, e2b_git_add, e2b_git_commit, or e2b_git_push and pass arguments in args. For a GitHub repository task, prefer importing the repo into E2B first, create a feature branch in E2B, make and test changes there, inspect git diff, then stage/commit/push only after approval.\nUse read_file before editing when useful. Use write_file for complete file content. Use run_command for tests/builds. Use external_tool for GitHub, Netlify or configured API actions. When the task is complete, return action=done.\n\nTask: ${task}\n\nPrevious tool results:\n${transcript.slice(-8).join("\n")}`;
       const reply = await requestChatCompletion(fakeChat, [], { id: `agent-${step}`, role: "user", content: instruction }, controller, model);
       const match = reply.match(/\{[\s\S]*\}/);
       if (!match) { transcript.push(`agent: ${reply.slice(0, 1000)}`); break; }
@@ -663,7 +673,13 @@ export default function Home() {
       try { action = JSON.parse(match[0]); } catch { transcript.push(`invalid agent JSON: ${reply.slice(0, 500)}`); break; }
       if (action.action === "done") { transcript.push(`done: ${String(action.message || "Task completed")}`); break; }
       if (action.action === "external_tool") {
-        await executeAgentConnector(action);
+        try {
+          await executeAgentConnector(action);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          transcript.push(`tool error: ${message}`);
+          persistRun("running", { step, lastAction: action.action, error: message });
+        }
       } else if (!sandbox && ["read_file", "write_file", "run_command", "list_files", "search_files", "git_status", "git_diff"].includes(action.action)) {
         throw new Error("Code runtime is not available for this agent.");
       } else if (action.action === "list_files") {
