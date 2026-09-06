@@ -135,6 +135,8 @@ export default function Home() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [keyOpen, setKeyOpen] = useState(false);
   const [keyError, setKeyError] = useState("");
+  const [keyTesting, setKeyTesting] = useState(false);
+  const [activityLogs, setActivityLogs] = useState<Array<{ id: string; time: string; type: "info" | "success" | "error"; text: string }>>([]);
   const [dark, setDark] = useState(true);
   const [sending, setSending] = useState<Record<string, boolean>>({});
   const [error, setError] = useState("");
@@ -453,7 +455,7 @@ export default function Home() {
     if (!value) return;
     if (!activeModel) { setKeyOpen(true); return; }
     const chat = chats.find((item) => item.id === activeId); if (!chat || sending[chat.id]) return;
-    setDraft(""); setError(""); setSending((prev) => ({ ...prev, [chat.id]: true }));
+    setDraft(""); setError(""); addActivityLog("info", `${activeModel.provider} request started · ${activeModel.model}`); setSending((prev) => ({ ...prev, [chat.id]: true }));
     const user: Message = { id: uid(), role: "user", content: value };
     const assistant: Message = { id: uid(), role: "assistant", content: "" };
     const history = chat.messages; const title = history.length ? chat.title : value.slice(0, 44);
@@ -462,8 +464,9 @@ export default function Home() {
     try {
       const answer = attachedConnections(chat).length ? await requestWithTools(chat, history, user, controller) : await requestChatCompletion(chat, history, user, controller);
       updateChatById(chat.id, [...history, user, { ...assistant, content: answer }], title);
+      addActivityLog("success", `${activeModel.provider} response completed.`);
     } catch (e) {
-      if ((e as Error).name !== "AbortError") { setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320)); updateChatById(chat.id, [...history, user], title); }
+      if ((e as Error).name !== "AbortError") { setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320)); addActivityLog("error", `${activeModel?.provider || "Model"} request failed: ${(e as Error).message.replace(/\s+/g, " ").slice(0, 360)}`); updateChatById(chat.id, [...history, user], title); }
     } finally { abortRef.current[chat.id] = null; setSending((prev) => ({ ...prev, [chat.id]: false })); }
   }
 
@@ -516,21 +519,50 @@ export default function Home() {
     } catch (error) { setIntegrationStatus((prev) => ({ ...prev, [provider]: error instanceof Error ? error.message : "Connection failed" })); }
   }
 
-  function saveKey() {
+  function addActivityLog(type: "info" | "success" | "error", text: string) {
+    setActivityLogs((prev) => [...prev.slice(-39), { id: uid(), time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }), type, text }]);
+  }
+
+  async function testModelConnection(connection: ModelConnection) {
+    const endpoint = modelEndpoint(connection);
+    const headers = modelHeaders(connection);
+    const body = connection.protocol === "responses"
+      ? { model: connection.model, input: "Reply with OK.", max_output_tokens: 1, stream: false }
+      : { model: connection.model, messages: [{ role: "user", content: "Reply with OK." }], max_tokens: 1, stream: false };
+    addActivityLog("info", `Testing ${connection.provider} · ${connection.model}…`);
+    const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(body) });
+    if (!response.ok) throw new Error(await modelError(response));
+    const data = await response.json();
+    const hasResponse = connection.protocol === "responses" ? Boolean(data?.id || data?.output_text || data?.output) : Boolean(data?.choices?.[0]);
+    if (!hasResponse) throw new Error("Provider returned an unexpected response format.");
+    return data;
+  }
+
+  async function saveKey() {
     const value = modelForm.apiKey.trim();
     const url = modelForm.baseUrl.trim();
     if (!value) { setKeyError("Paste your model API key first."); return; }
     if (!url) { setKeyError("Enter the model API base URL."); return; }
     if (!modelForm.model.trim()) { setKeyError("Enter the model ID."); return; }
-    const connection: ModelConnection = { ...modelForm, id: modelForm.id || uid(), name: modelForm.name.trim() || modelForm.provider, baseUrl: url.replace(/\/$/, ""), model: modelForm.model.trim() };
-    setModelConnections((prev) => [...prev.filter((item) => item.id !== connection.id), connection]);
-    setActiveModelId(connection.id);
-    setApiKey(connection.apiKey);
-    setSettings((prev) => ({ ...prev, model: connection.model }));
-    sessionStorage.setItem(MODEL_CONNECTIONS, JSON.stringify([...modelConnections.filter((item) => item.id !== connection.id), connection]));
-    sessionStorage.setItem(ACTIVE_MODEL, connection.id);
-    sessionStorage.setItem(KEY, connection.apiKey);
-    setKeyError(""); setKeyOpen(false);
+    const connection: ModelConnection = { ...modelForm, id: modelForm.id || uid(), name: modelForm.name.trim() || modelForm.provider, baseUrl: url.replace(/\/$/, ""), model: modelForm.model.trim(), apiKey: value };
+    setKeyTesting(true); setKeyError("");
+    try {
+      await testModelConnection(connection);
+      setModelConnections((prev) => [...prev.filter((item) => item.id !== connection.id), connection]);
+      setActiveModelId(connection.id);
+      setApiKey(connection.apiKey);
+      setSettings((prev) => ({ ...prev, model: connection.model }));
+      const nextModels = [...modelConnections.filter((item) => item.id !== connection.id), connection];
+      sessionStorage.setItem(MODEL_CONNECTIONS, JSON.stringify(nextModels));
+      sessionStorage.setItem(ACTIVE_MODEL, connection.id);
+      sessionStorage.setItem(KEY, connection.apiKey);
+      addActivityLog("success", `${connection.provider} connection verified successfully.`);
+      setKeyError(""); setKeyOpen(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Connection failed.";
+      setKeyError(message.replace(/\s+/g, " ").slice(0, 500));
+      addActivityLog("error", `${connection.provider} connection failed: ${message.replace(/\s+/g, " ").slice(0, 360)}`);
+    } finally { setKeyTesting(false); }
   }
 
   function removeModelConnection(id: string) {
@@ -753,6 +785,10 @@ export default function Home() {
         </div>
 
         <div className="composer-area">
+          {activityLogs.length > 0 && <div className="activity-log" role="log" aria-label="Request activity log">
+            <div className="activity-log-head"><span><i />Activity log</span><button onClick={() => setActivityLogs([])}>Clear</button></div>
+            <div className="activity-log-list">{activityLogs.map((entry) => <div className={`activity-log-entry ${entry.type}`} key={entry.id}><time>{entry.time}</time><span>{entry.text}</span></div>)}</div>
+          </div>}
           <div className="composer-glow" />
           <div className="composer">
             {attachedName && <div className="attachment-chip"><FileText size={13}/><span>{attachedName}</span><button onClick={() => {setAttachedName("");setAttachedText("");}}><X size={12}/></button></div>}
@@ -807,7 +843,7 @@ export default function Home() {
           <div className="form-grid"><label className="field"><span>API key</span><input autoFocus type="password" value={modelForm.apiKey} onChange={(e) => { setModelForm({...modelForm,apiKey:e.target.value}); setKeyError(""); }} placeholder="Paste any provider key" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label><label className="field"><span>Auth header</span><input value={modelForm.authHeader} onChange={(e) => setModelForm({...modelForm,authHeader:e.target.value})} placeholder="Authorization" /></label></div>
           <div className="form-grid"><label className="field"><span>Auth prefix</span><input value={modelForm.authPrefix} onChange={(e) => setModelForm({...modelForm,authPrefix:e.target.value})} placeholder="Bearer" /></label><label className="field"><span>API protocol</span><select value={modelForm.protocol} onChange={(e) => setModelForm({...modelForm,protocol:e.target.value as ModelConnection["protocol"]})}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label></div>
           <div className="security-note"><KeyRound size={14} /><span>Supports Gemini, OpenAI, OpenRouter, Groq, Mistral and custom OpenAI-compatible endpoints. A native provider API that is not OpenAI-compatible needs a dedicated adapter.</span></div>{keyError && <div className="key-error" role="alert">{keyError}</div>}
-          <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey}>Save & connect</button></div>
+          <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey} disabled={keyTesting}>{keyTesting ? "Testing connection…" : "Test & connect"}</button></div>
         </Modal>
       )}
 

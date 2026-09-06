@@ -186,3 +186,17 @@
 @media (max-width: 640px) {
   .model-connection-row small { max-width:190px; }
 }
+
+
+/* Request activity log: dedicated space above the composer, never overlaying conversation messages. */
+.activity-log{position:relative;z-index:4;flex:0 0 auto;width:min(900px,calc(100% - 32px));margin:0 auto 8px;padding:8px 10px;border:1px solid var(--border);border-radius:14px;background:var(--panel);backdrop-filter:blur(16px);box-shadow:0 8px 30px rgba(0,0,0,.12);}
+.activity-log-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:1px 2px 7px;font-size:11px;color:var(--muted);}
+.activity-log-head span{display:flex;align-items:center;gap:7px;font-weight:600;color:var(--text);}
+.activity-log-head span i{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.75;}
+.activity-log-head button{border:0;background:transparent;color:var(--muted);font-size:10px;cursor:pointer;padding:3px 5px;}
+.activity-log-list{max-height:92px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;padding-right:3px;}
+.activity-log-entry{display:grid;grid-template-columns:62px 1fr;gap:8px;align-items:start;font-size:10px;line-height:1.4;color:var(--muted);}
+.activity-log-entry time{font-variant-numeric:tabular-nums;opacity:.7;}
+.activity-log-entry.success span{color:#8fe0ad}.activity-log-entry.error span{color:#f0a0b9}.activity-log-entry.info span{color:var(--text);opacity:.82}
+.activity-log + .composer-glow{pointer-events:none;}
+@media(max-width:560px){.activity-log{width:calc(100% - 20px);margin-bottom:6px;padding:7px 9px}.activity-log-list{max-height:82px}.activity-log-entry{grid-template-columns:52px 1fr;font-size:9px}.composer-area{padding-bottom:max(8px,env(safe-area-inset-bottom));}}
