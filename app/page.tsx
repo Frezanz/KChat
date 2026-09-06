@@ -36,12 +36,16 @@ import {
 type Role = "user" | "assistant";
 type Message = { id: string; role: Role; content: string };
 type ContextMode = "isolated" | "connected" | "global";
-type Chat = { id: string; title: string; messages: Message[]; updatedAt: number; contextMode: ContextMode; connectedChats: string[] };
+type Chat = { id: string; title: string; messages: Message[]; updatedAt: number; contextMode: ContextMode; connectedChats: string[]; connectionIds: string[] };
 type Settings = { model: string; system: string; temperature: number };
+type ApiConnection = { id: string; kind: "api"; name: string; description: string; url: string; method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; headers: Record<string, string>; inputSchema: Record<string, unknown> };
+type McpConnection = { id: string; kind: "mcp"; name: string; description: string; serverUrl: string; headers: Record<string, string>; requireApproval: "always" | "never" };
+type Connection = ApiConnection | McpConnection;
 
 const KEY = "kchat-api-key";
 const CHATS = "kchat-chats-v3";
 const SETTINGS = "kchat-settings-v3";
+const CONNECTIONS = "kchat-connections-v1";
 const DEFAULT_SETTINGS: Settings = {
   model: "gpt-6",
   temperature: 0.7,
@@ -60,7 +64,7 @@ function uid() {
 }
 
 function makeChat(): Chat {
-  return { id: uid(), title: "New conversation", messages: [], updatedAt: Date.now(), contextMode: "isolated", connectedChats: [] };
+  return { id: uid(), title: "New conversation", messages: [], updatedAt: Date.now(), contextMode: "isolated", connectedChats: [], connectionIds: [] };
 }
 
 function load<T>(key: string, fallback: T): T {
@@ -110,10 +114,24 @@ export default function Home() {
   const [fullscreenId, setFullscreenId] = useState<string | null>(null);
   const [gridDrafts, setGridDrafts] = useState<Record<string, string>>({});
   const [gridSending, setGridSending] = useState<Record<string, boolean>>({});
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [connectionTab, setConnectionTab] = useState<"api" | "mcp">("api");
+  const [connectionFormOpen, setConnectionFormOpen] = useState(false);
+  const [apiForm, setApiForm] = useState({ name: "", description: "", url: "", method: "GET" as ApiConnection["method"], headers: "{}", inputSchema: '{"type":"object","properties":{}}' });
+  const [mcpForm, setMcpForm] = useState({ name: "", description: "", serverUrl: "", headers: "{}", requireApproval: "never" as McpConnection["requireApproval"] });
+  const [connectionError, setConnectionError] = useState("");
   useEffect(() => {
     setGithubToken(sessionStorage.getItem("kchat-github-token") || "");
     setNetlifyToken(sessionStorage.getItem("kchat-netlify-token") || "");
+    try {
+      const raw = sessionStorage.getItem(CONNECTIONS);
+      if (raw) setConnections(JSON.parse(raw) as Connection[]);
+    } catch {}
   }, []);
+
+  useEffect(() => {
+    sessionStorage.setItem(CONNECTIONS, JSON.stringify(connections));
+  }, [connections]);
   useEffect(() => {
     fetch("/api/auth/me", { cache: "no-store" }).then((response) => response.ok ? response.json() : null).then((data) => { if (data?.user) setProfileUser(data.user); }).catch(() => {});
   }, []);
@@ -125,7 +143,7 @@ export default function Home() {
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    setChats(prev => prev.map(chat => ({ ...chat, contextMode: chat.contextMode || "isolated", connectedChats: chat.connectedChats || [] })));
+    setChats(prev => prev.map(chat => ({ ...chat, contextMode: chat.contextMode || "isolated", connectedChats: chat.connectedChats || [], connectionIds: chat.connectionIds || [] })));
   }, []);
 
   useEffect(() => {
@@ -191,72 +209,116 @@ export default function Home() {
     return [...context, ...history];
   }
 
+  function parseJsonObject(value: string, label: string) {
+    const parsed = JSON.parse(value || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${label} must be a JSON object.`);
+    return parsed as Record<string, unknown>;
+  }
+
+  function toolName(connection: ApiConnection) {
+    const base = `api_${connection.name}_${connection.id}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+    return base.slice(0, 64);
+  }
+
+  function attachedConnections(chat: Chat) {
+    return connections.filter((connection) => chat.connectionIds?.includes(connection.id));
+  }
+
+  function buildTools(chat: Chat) {
+    return attachedConnections(chat).map((connection) => connection.kind === "mcp"
+      ? {
+          type: "mcp",
+          server_label: connection.name.slice(0, 64),
+          server_url: connection.serverUrl,
+          ...(Object.keys(connection.headers).length ? { headers: connection.headers } : {}),
+          require_approval: connection.requireApproval,
+          ...(connection.description ? { server_description: connection.description } : {}),
+        }
+      : {
+          type: "function",
+          name: toolName(connection),
+          description: connection.description || `Call the ${connection.name} API.`,
+          parameters: connection.inputSchema,
+          strict: false,
+        });
+  }
+
+  async function executeApiConnection(connection: ApiConnection, args: Record<string, unknown>, signal: AbortSignal) {
+    const response = await fetch("/api/connectors/api", {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ connection, args }),
+    });
+    const data = await response.json().catch(() => ({ error: "Invalid connector response." }));
+    if (!response.ok) throw new Error(data?.error || `API tool failed (${response.status})`);
+    return data;
+  }
+
+  async function requestWithTools(chat: Chat, history: Message[], user: Message, controller: AbortController) {
+    const tools = buildTools(chat);
+    const input: any[] = [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content }));
+    let previousResponseId: string | undefined;
+    for (let round = 0; round < 8; round += 1) {
+      const body: Record<string, unknown> = {
+        model: settings.model,
+        instructions: settings.system,
+        input,
+        temperature: settings.temperature,
+        stream: false,
+        parallel_tool_calls: false,
+        ...(tools.length ? { tools } : {}),
+      };
+      if (previousResponseId) body.previous_response_id = previousResponseId;
+      const response = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST", signal: controller.signal,
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+      const data = await response.json();
+      const approval = (data.output || []).find((item: any) => item.type === "mcp_approval_request");
+      if (approval) throw new Error(`MCP ${approval.server_label || "server"} requested approval. Change its approval setting to Allow automatically or add an approval flow.`);
+      const calls = (data.output || []).filter((item: any) => item.type === "function_call");
+      if (!calls.length) return data.output_text || "The model returned an empty response.";
+      previousResponseId = data.id;
+      const outputs: any[] = [];
+      for (const call of calls) {
+        const connection = attachedConnections(chat).find((item) => item.kind === "api" && toolName(item) === call.name) as ApiConnection | undefined;
+        if (!connection) {
+          outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "API connection is no longer attached." }) });
+          continue;
+        }
+        try {
+          const args = JSON.parse(call.arguments || "{}");
+          const result = await executeApiConnection(connection, args, controller.signal);
+          outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(result).slice(0, 50000) });
+        } catch (error) {
+          outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: (error as Error).message }) });
+        }
+      }
+      input.splice(0, input.length, ...outputs);
+    }
+    throw new Error("Tool loop exceeded the 8-call safety limit.");
+  }
+
   async function sendGrid(chatId: string) {
     const value = (gridDrafts[chatId] || "").trim();
-    if (!value || gridSending[chatId] || !apiKey) {
-      if (!apiKey) setKeyOpen(true);
-      return;
-    }
-    const chat = chats.find((item) => item.id === chatId);
-    if (!chat) return;
+    if (!value || gridSending[chatId] || !apiKey) { if (!apiKey) setKeyOpen(true); return; }
+    const chat = chats.find((item) => item.id === chatId); if (!chat) return;
     const history = chat.messages;
     const user: Message = { id: uid(), role: "user", content: value };
     const assistant: Message = { id: uid(), role: "assistant", content: "" };
     const title = history.length ? chat.title : value.slice(0, 44);
-    setGridDrafts((prev) => ({ ...prev, [chatId]: "" }));
-    setGridSending((prev) => ({ ...prev, [chatId]: true }));
-    setError("");
+    setGridDrafts((prev) => ({ ...prev, [chatId]: "" })); setGridSending((prev) => ({ ...prev, [chatId]: true })); setError("");
     updateChatById(chatId, [...history, user, assistant], title);
-    const controller = new AbortController();
-    gridAbortRef.current[chatId] = controller;
+    const controller = new AbortController(); gridAbortRef.current[chatId] = controller;
     try {
-      const response = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST",
-        signal: controller.signal,
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: settings.model,
-          instructions: settings.system,
-          input: [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content })),
-          temperature: settings.temperature,
-          stream: true,
-        }),
-      });
-      if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
-      if (!response.body) throw new Error("The model returned no stream.");
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let answer = "";
-      while (true) {
-        const { done, value: chunk } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(chunk, { stream: true });
-        const events = buffer.split("\n\n");
-        buffer = events.pop() || "";
-        for (const event of events) {
-          const line = event.split("\n").find((item) => item.startsWith("data:"));
-          if (!line) continue;
-          const raw = line.slice(5).trim();
-          if (!raw || raw === "[DONE]") continue;
-          const data = JSON.parse(raw) as { type?: string; delta?: string; error?: { message?: string } };
-          if (data.type === "response.output_text.delta") {
-            answer += data.delta || "";
-            updateChatById(chatId, [...history, user, { ...assistant, content: answer }], title);
-          }
-          if (data.type === "error") throw new Error(data.error?.message || "Model error");
-        }
-      }
-      if (!answer) updateChatById(chatId, [...history, user, { ...assistant, content: "The model returned an empty response." }], title);
+      const answer = await requestWithTools(chat, history, user, controller);
+      updateChatById(chatId, [...history, user, { ...assistant, content: answer }], title);
     } catch (e) {
-      if ((e as Error).name !== "AbortError") {
-        setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320));
-        updateChatById(chatId, [...history, user], title);
-      }
-    } finally {
-      gridAbortRef.current[chatId] = null;
-      setGridSending((prev) => ({ ...prev, [chatId]: false }));
-    }
+      if ((e as Error).name !== "AbortError") { setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320)); updateChatById(chatId, [...history, user], title); }
+    } finally { gridAbortRef.current[chatId] = null; setGridSending((prev) => ({ ...prev, [chatId]: false })); }
   }
 
   function stopGrid(chatId: string) {
@@ -307,52 +369,67 @@ export default function Home() {
     if (attachedText) value += `\n\n[Attached file: ${attachedName}]\n${attachedText}`;
     if (!value) return;
     if (!apiKey) { setKeyOpen(true); return; }
-    const chat = chats.find((item) => item.id === activeId);
-    if (!chat || sending[chat.id]) return;
-    setDraft(""); setError("");
-    setSending((prev) => ({ ...prev, [chat.id]: true }));
+    const chat = chats.find((item) => item.id === activeId); if (!chat || sending[chat.id]) return;
+    setDraft(""); setError(""); setSending((prev) => ({ ...prev, [chat.id]: true }));
     const user: Message = { id: uid(), role: "user", content: value };
     const assistant: Message = { id: uid(), role: "assistant", content: "" };
-    const history = chat.messages;
-    const title = history.length ? chat.title : value.slice(0, 44);
+    const history = chat.messages; const title = history.length ? chat.title : value.slice(0, 44);
     updateChatById(chat.id, [...history, user, assistant], title);
-    const controller = new AbortController();
-    abortRef.current[chat.id] = controller;
+    const controller = new AbortController(); abortRef.current[chat.id] = controller;
     try {
-      const response = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST", signal: controller.signal,
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: settings.model, instructions: settings.system,
-          input: [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content })),
-          temperature: settings.temperature, stream: true,
-        }),
-      });
-      if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
-      if (!response.body) throw new Error("The model returned no stream.");
-      const reader = response.body.getReader(); const decoder = new TextDecoder();
-      let buffer = "", answer = "";
-      while (true) {
-        const { done, value: chunk } = await reader.read(); if (done) break;
-        buffer += decoder.decode(chunk, { stream: true });
-        const events = buffer.split("\n\n"); buffer = events.pop() || "";
-        for (const event of events) {
-          const line = event.split("\n").find((item) => item.startsWith("data:")); if (!line) continue;
-          const raw = line.slice(5).trim(); if (!raw || raw === "[DONE]") continue;
-          const data = JSON.parse(raw) as { type?: string; delta?: string; error?: { message?: string } };
-          if (data.type === "response.output_text.delta") { answer += data.delta || ""; updateChatById(chat.id, [...history, user, { ...assistant, content: answer }], title); }
-          if (data.type === "error") throw new Error(data.error?.message || "Model error");
+      if (!attachedConnections(chat).length) {
+        const response = await fetch("https://api.openai.com/v1/responses", {
+          method: "POST", signal: controller.signal,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({ model: settings.model, instructions: settings.system, input: [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content })), temperature: settings.temperature, stream: true }),
+        });
+        if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+        if (!response.body) throw new Error("The model returned no stream.");
+        const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "", answer = "";
+        while (true) {
+          const { done, value: chunk } = await reader.read(); if (done) break;
+          buffer += decoder.decode(chunk, { stream: true }); const events = buffer.split("\n\n"); buffer = events.pop() || "";
+          for (const event of events) { const line = event.split("\n").find((item) => item.startsWith("data:")); if (!line) continue; const raw = line.slice(5).trim(); if (!raw || raw === "[DONE]") continue; const data = JSON.parse(raw) as { type?: string; delta?: string; error?: { message?: string } }; if (data.type === "response.output_text.delta") { answer += data.delta || ""; updateChatById(chat.id, [...history, user, { ...assistant, content: answer }], title); } if (data.type === "error") throw new Error(data.error?.message || "Model error"); }
         }
+        if (!answer) updateChatById(chat.id, [...history, user, { ...assistant, content: "The model returned an empty response." }], title);
+      } else {
+        const answer = await requestWithTools(chat, history, user, controller);
+        updateChatById(chat.id, [...history, user, { ...assistant, content: answer }], title);
       }
-      if (!answer) updateChatById(chat.id, [...history, user, { ...assistant, content: "The model returned an empty response." }], title);
     } catch (e) {
       if ((e as Error).name !== "AbortError") { setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320)); updateChatById(chat.id, [...history, user], title); }
-    } finally {
-      abortRef.current[chat.id] = null; setSending((prev) => ({ ...prev, [chat.id]: false }));
-    }
+    } finally { abortRef.current[chat.id] = null; setSending((prev) => ({ ...prev, [chat.id]: false })); }
   }
 
   function stop(chatId = activeId) { abortRef.current[chatId]?.abort(); setSending((prev) => ({ ...prev, [chatId]: false })); }
+
+  function toggleChatConnection(connectionId: string) {
+    setChats((prev) => prev.map((chat) => chat.id === active.id ? { ...chat, connectionIds: chat.connectionIds.includes(connectionId) ? chat.connectionIds.filter((id) => id !== connectionId) : [...chat.connectionIds, connectionId] } : chat));
+  }
+
+  function saveApiConnection() {
+    try {
+      const headers = parseJsonObject(apiForm.headers, "Headers");
+      const inputSchema = parseJsonObject(apiForm.inputSchema, "Input schema");
+      if (!apiForm.name.trim() || !apiForm.url.trim()) throw new Error("Name and URL are required.");
+      const connection: ApiConnection = { id: uid(), kind: "api", name: apiForm.name.trim(), description: apiForm.description.trim(), url: apiForm.url.trim(), method: apiForm.method, headers: headers as Record<string, string>, inputSchema };
+      setConnections((prev) => [...prev, connection]); setApiForm({ name: "", description: "", url: "", method: "GET", headers: "{}", inputSchema: '{"type":"object","properties":{}}' }); setConnectionFormOpen(false); setConnectionError("");
+    } catch (error) { setConnectionError((error as Error).message); }
+  }
+
+  function saveMcpConnection() {
+    try {
+      const headers = parseJsonObject(mcpForm.headers, "Headers");
+      if (!mcpForm.name.trim() || !mcpForm.serverUrl.trim()) throw new Error("Name and server URL are required.");
+      const connection: McpConnection = { id: uid(), kind: "mcp", name: mcpForm.name.trim(), description: mcpForm.description.trim(), serverUrl: mcpForm.serverUrl.trim(), headers: headers as Record<string, string>, requireApproval: mcpForm.requireApproval };
+      setConnections((prev) => [...prev, connection]); setMcpForm({ name: "", description: "", serverUrl: "", headers: "{}", requireApproval: "never" }); setConnectionFormOpen(false); setConnectionError("");
+    } catch (error) { setConnectionError((error as Error).message); }
+  }
+
+  function removeConnection(id: string) {
+    setConnections((prev) => prev.filter((connection) => connection.id !== id));
+    setChats((prev) => prev.map((chat) => ({ ...chat, connectionIds: chat.connectionIds.filter((connectionId) => connectionId !== id) })));
+  }
 
   function saveIntegrationCredentials() {
     if (githubToken.trim()) sessionStorage.setItem("kchat-github-token", githubToken.trim()); else sessionStorage.removeItem("kchat-github-token");
@@ -584,9 +661,10 @@ export default function Home() {
           <div className="composer-glow" />
           <div className="composer">
             {attachedName && <div className="attachment-chip"><FileText size={13}/><span>{attachedName}</span><button onClick={() => {setAttachedName("");setAttachedText("");}}><X size={12}/></button></div>}
+            {attachedConnections(active).length > 0 && <div className="connection-chips">{attachedConnections(active).map((connection) => <button key={connection.id} className="connection-chip" onClick={() => setIntegrationsOpen(true)} title="Manage chat connections"><Plug size={12}/><span>{connection.name}</span><X size={11}/></button>)}</div>}
             <textarea ref={textareaRef} value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} placeholder="Message KChat…" rows={1} />
             <div className="composer-bottom">
-              <div className="composer-left"><input ref={fileRef} type="file" hidden onChange={e => { attach(e.target.files?.[0]); e.currentTarget.value=""; }}/><button title="Attach file" onClick={() => fileRef.current?.click()}><Paperclip size={17}/></button><div className="tools-wrap"><button title="Quick tools" onClick={() => { setToolsOpen(v=>!v); }}><Plus size={18}/></button>{toolsOpen && <div className="tools-menu"><button onClick={() => useQuickPrompt("Improve this prompt:")}><Sparkles size={13}/> Improve prompt</button><button onClick={() => useQuickPrompt("Explain this simply:")}><Sparkles size={13}/> Explain simply</button><button onClick={() => useQuickPrompt("Brainstorm 10 strong ideas for:")}><Sparkles size={13}/> Brainstorm</button></div>}</div><span className="composer-model">{settings.model}</span></div>
+              <div className="composer-left"><input ref={fileRef} type="file" hidden onChange={e => { attach(e.target.files?.[0]); e.currentTarget.value=""; }}/><button title="Attach file" onClick={() => fileRef.current?.click()}><Paperclip size={17}/></button><div className="tools-wrap"><button title="Connect API or MCP" onClick={() => setIntegrationsOpen(true)}><Plug size={16}/></button><button title="Quick tools" onClick={() => { setToolsOpen(v=>!v); }}><Plus size={18}/></button>{toolsOpen && <div className="tools-menu"><button onClick={() => useQuickPrompt("Improve this prompt:")}><Sparkles size={13}/> Improve prompt</button><button onClick={() => useQuickPrompt("Explain this simply:")}><Sparkles size={13}/> Explain simply</button><button onClick={() => useQuickPrompt("Brainstorm 10 strong ideas for:")}><Sparkles size={13}/> Brainstorm</button></div>}</div><span className="composer-model">{settings.model}</span></div>
               <div className="composer-right"><span className="connection-label"><i />{apiKey ? "Ready" : "API key required"}</span>{sending[active.id] ? <button className="send-btn stop" onClick={() => stop(active.id)}><Square size={13} fill="currentColor" /></button> : <button className="send-btn" onClick={() => send()} disabled={!draft.trim() && !attachedText}><ArrowUp size={17} /></button>}</div>
             </div>
           </div>
@@ -619,6 +697,7 @@ export default function Home() {
            </label>
           {target.contextMode === "connected" && <label className="field"><span>Connected conversations</span><div className="chat-picker">{chats.filter(c => c.id !== target.id).map(c => <label key={c.id}><input type="checkbox" checked={target.connectedChats.includes(c.id)} onChange={(e) => setChats(prev => prev.map(x => x.id === target.id ? { ...x, connectedChats: e.target.checked ? [...x.connectedChats, c.id] : x.connectedChats.filter(id => id !== c.id) } : x))}/><span>{c.title}</span></label>)}</div></label>}
           <div className="security-note"><Sparkles size={14}/><span>Only recent messages from permitted chats are injected as context when you generate.</span></div>
+          <div className="connection-section"><div className="connection-section-head"><div><strong>Chat connections</strong><span>Attach APIs and MCP servers to this conversation.</span></div><button className="secondary mini" onClick={() => { setChatSettingsId(null); setIntegrationsOpen(true); }}>Manage</button></div>{connections.length ? <div className="connection-list compact">{connections.map((connection) => <button className={`connection-row compact-row ${target.connectionIds.includes(connection.id) ? "attached" : ""}`} key={connection.id} onClick={() => setChats((prev) => prev.map((chat) => chat.id === target.id ? { ...chat, connectionIds: chat.connectionIds.includes(connection.id) ? chat.connectionIds.filter((id) => id !== connection.id) : [...chat.connectionIds, connection.id] } : chat))}><span className="connection-type-icon">{connection.kind === "mcp" ? "M" : "API"}</span><span><strong>{connection.name}</strong><small>{connection.kind === "mcp" ? "Remote MCP" : `${connection.method} API`}</small></span><span className="connection-state">{target.connectionIds.includes(connection.id) ? "Attached" : "Attach"}</span></button>)}</div> : <div className="connection-empty">No custom connections. Use Manage to add one.</div>}</div>
           <div className="modal-actions"><button className="primary" onClick={() => setChatSettingsId(null)}>Done</button></div>
         </Modal>;
       })()}
@@ -634,14 +713,39 @@ export default function Home() {
 
       {integrationsOpen && (
         <Modal title="Connections & tools" icon={<Plug size={17} />} onClose={() => setIntegrationsOpen(false)}>
-          <div className="modal-intro"><div className="intro-glow"><Plug size={20}/></div><div><strong>Give KChat tools</strong><p>Connect services for repository editing, deployments and future agent actions. Tokens stay in this browser session.</p></div></div>
-          <div className="integration-card"><div className="integration-head"><div className="integration-icon"><Github size={17}/></div><div><strong>GitHub</strong><span>Read and edit repositories, branches and pull requests.</span></div></div><input type="password" value={githubToken} onChange={(e) => setGithubToken(e.target.value)} placeholder="GitHub token"/><div className="integration-actions"><button className="secondary" onClick={() => { setGithubToken(""); sessionStorage.removeItem("kchat-github-token"); setIntegrationStatus((prev) => ({ ...prev, github: "Disconnected" })); }}>Disconnect</button><button className="primary" onClick={() => testIntegration("github")}>Test & connect</button></div>{integrationStatus.github && <small>{integrationStatus.github}</small>}</div>
-          <div className="integration-card"><div className="integration-head"><div className="integration-icon"><Globe2 size={17}/></div><div><strong>Netlify</strong><span>Inspect projects, deploys and trigger builds.</span></div></div><input type="password" value={netlifyToken} onChange={(e) => setNetlifyToken(e.target.value)} placeholder="Netlify token"/><div className="integration-actions"><button className="secondary" onClick={() => { setNetlifyToken(""); sessionStorage.removeItem("kchat-netlify-token"); setIntegrationStatus((prev) => ({ ...prev, netlify: "Disconnected" })); }}>Disconnect</button><button className="primary" onClick={() => testIntegration("netlify")}>Test & connect</button></div>{integrationStatus.netlify && <small>{integrationStatus.netlify}</small>}</div>
-          <div className="security-note"><Plug size={14}/><span>Write/deploy tools are marked for confirmation. More connectors can use the same tool registry.</span></div>
+          <div className="modal-intro"><div className="intro-glow"><Plug size={20}/></div><div><strong>Connect anything to this chat</strong><p>Add API tools, remote MCP servers, GitHub and Netlify. New API/MCP connections stay in this browser session and can be attached per conversation.</p></div></div>
+          <div className="connection-section"><div className="connection-section-head"><div><strong>Attached to this chat</strong><span>{attachedConnections(active).length ? `${attachedConnections(active).length} connection${attachedConnections(active).length === 1 ? "" : "s"}` : "Nothing attached"}</span></div></div>
+            {connections.length ? <div className="connection-list">{connections.map((connection) => <div className={`connection-row ${active.connectionIds.includes(connection.id) ? "attached" : ""}`} key={connection.id}><button className="connection-toggle" onClick={() => toggleChatConnection(connection.id)}><span className="connection-type-icon">{connection.kind === "mcp" ? "M" : "API"}</span><span><strong>{connection.name}</strong><small>{connection.kind === "mcp" ? connection.serverUrl : `${connection.method} ${connection.url}`}</small></span></button><div className="connection-row-actions"><button className="secondary mini" onClick={() => toggleChatConnection(connection.id)}>{active.connectionIds.includes(connection.id) ? "Attached" : "Attach"}</button><button className="icon-btn mini-icon" title="Remove" onClick={() => removeConnection(connection.id)}><Trash2 size={13}/></button></div></div>)}</div> : <div className="connection-empty">No custom API or MCP connections yet.</div>}
+          </div>
+          <div className="connection-tabs"><button className={connectionTab === "api" ? "selected" : ""} onClick={() => { setConnectionTab("api"); setConnectionFormOpen(true); }}>+ API tool</button><button className={connectionTab === "mcp" ? "selected" : ""} onClick={() => { setConnectionTab("mcp"); setConnectionFormOpen(true); }}>+ MCP server</button></div>
+          {connectionFormOpen && <div className="connection-form">
+            {connectionTab === "api" ? <>
+              <div className="form-grid"><label className="field"><span>Name</span><input value={apiForm.name} onChange={(e) => setApiForm({...apiForm,name:e.target.value})} placeholder="My API" /></label><label className="field"><span>Method</span><select value={apiForm.method} onChange={(e) => setApiForm({...apiForm,method:e.target.value as ApiConnection["method"]})}><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></label></div>
+              <label className="field"><span>Endpoint URL</span><input value={apiForm.url} onChange={(e) => setApiForm({...apiForm,url:e.target.value})} placeholder="https://api.example.com/search" /></label>
+              <label className="field"><span>Description</span><input value={apiForm.description} onChange={(e) => setApiForm({...apiForm,description:e.target.value})} placeholder="Search my service" /></label>
+              <label className="field"><span>Headers JSON</span><textarea rows={3} value={apiForm.headers} onChange={(e) => setApiForm({...apiForm,headers:e.target.value})} placeholder='{"Authorization":"Bearer ..."}' /></label>
+              <label className="field"><span>Input schema JSON</span><textarea rows={6} value={apiForm.inputSchema} onChange={(e) => setApiForm({...apiForm,inputSchema:e.target.value})} /></label>
+              <p className="field-hint">The model sees the name, description and schema—not your secret header values. API calls are executed by KChat's connector route.</p>
+              <div className="modal-actions"><button className="secondary" onClick={() => setConnectionFormOpen(false)}>Cancel</button><button className="primary" onClick={saveApiConnection}>Add API tool</button></div>
+            </> : <>
+              <label className="field"><span>Name</span><input value={mcpForm.name} onChange={(e) => setMcpForm({...mcpForm,name:e.target.value})} placeholder="My MCP" /></label>
+              <label className="field"><span>MCP server URL</span><input value={mcpForm.serverUrl} onChange={(e) => setMcpForm({...mcpForm,serverUrl:e.target.value})} placeholder="https://example.com/mcp" /></label>
+              <label className="field"><span>Description</span><input value={mcpForm.description} onChange={(e) => setMcpForm({...mcpForm,description:e.target.value})} placeholder="What this server provides" /></label>
+              <label className="field"><span>Headers JSON</span><textarea rows={4} value={mcpForm.headers} onChange={(e) => setMcpForm({...mcpForm,headers:e.target.value})} placeholder='{"Authorization":"Bearer ..."}' /></label>
+              <label className="field"><span>Tool approval</span><select value={mcpForm.requireApproval} onChange={(e) => setMcpForm({...mcpForm,requireApproval:e.target.value as McpConnection["requireApproval"]})}><option value="never">Allow automatically</option><option value="always">Ask before every MCP action</option></select></label>
+              <p className="field-hint">KChat passes remote MCP servers to the Responses API as native MCP tools. Remote HTTP MCP is supported; local stdio servers need a separate local agent/worker.</p>
+              <div className="modal-actions"><button className="secondary" onClick={() => setConnectionFormOpen(false)}>Cancel</button><button className="primary" onClick={saveMcpConnection}>Add MCP server</button></div>
+            </>}
+            {connectionError && <div className="key-error" role="alert">{connectionError}</div>}
+          </div>}
+          <div className="connection-section"><div className="connection-section-head"><div><strong>Existing app connectors</strong><span>Already available in KChat</span></div></div>
+            <div className="integration-card"><div className="integration-head"><div className="integration-icon"><Github size={17}/></div><div><strong>GitHub</strong><span>Read and edit repositories, branches and pull requests.</span></div></div><input type="password" value={githubToken} onChange={(e) => setGithubToken(e.target.value)} placeholder="GitHub token"/><div className="integration-actions"><button className="secondary" onClick={() => { setGithubToken(""); sessionStorage.removeItem("kchat-github-token"); setIntegrationStatus((prev) => ({ ...prev, github: "Disconnected" })); }}>Disconnect</button><button className="primary" onClick={() => testIntegration("github")}>Test & connect</button></div>{integrationStatus.github && <small>{integrationStatus.github}</small>}</div>
+            <div className="integration-card"><div className="integration-head"><div className="integration-icon"><Globe2 size={17}/></div><div><strong>Netlify</strong><span>Inspect projects, deploys and trigger builds.</span></div></div><input type="password" value={netlifyToken} onChange={(e) => setNetlifyToken(e.target.value)} placeholder="Netlify token"/><div className="integration-actions"><button className="secondary" onClick={() => { setNetlifyToken(""); sessionStorage.removeItem("kchat-netlify-token"); setIntegrationStatus((prev) => ({ ...prev, netlify: "Disconnected" })); }}>Disconnect</button><button className="primary" onClick={() => testIntegration("netlify")}>Test & connect</button></div>{integrationStatus.netlify && <small>{integrationStatus.netlify}</small>}</div>
+          </div>
+          <div className="security-note"><Plug size={14}/><span>Only attach services you trust. External tool results are untrusted data; destructive actions should use approval.</span></div>
           <div className="modal-actions"><button className="primary" onClick={() => { saveIntegrationCredentials(); setIntegrationsOpen(false); }}>Done</button></div>
         </Modal>
       )}
-
       {settingsOpen && (
         <Modal title="KChat settings" icon={<Settings2 size={17} />} onClose={() => setSettingsOpen(false)}>
           <div className="settings-tabs"><span className="selected">Model</span><span>Behavior</span><span>Privacy</span></div>
