@@ -20,10 +20,8 @@ export async function ensureDatabaseSchema() {
   if (!globalForDb.kchatSchemaReady) {
     globalForDb.kchatSchemaReady = (async () => {
       await db.query(`
-        CREATE EXTENSION IF NOT EXISTS pgcrypto;
-
         CREATE TABLE IF NOT EXISTS users (
-          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          id UUID PRIMARY KEY,
           email TEXT NOT NULL UNIQUE,
           password_hash TEXT NOT NULL,
           name TEXT,
@@ -32,7 +30,7 @@ export async function ensureDatabaseSchema() {
         );
 
         CREATE TABLE IF NOT EXISTS sessions (
-          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          id UUID PRIMARY KEY,
           user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           token_hash TEXT NOT NULL UNIQUE,
           expires_at TIMESTAMPTZ NOT NULL,

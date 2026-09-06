@@ -13,11 +13,12 @@ export const hashToken = (token: string) => crypto.createHash("sha256").update(t
 
 export async function createSession(userId: string) {
   await ensureDatabaseSchema();
+  const id = crypto.randomUUID();
   const token = createToken();
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 86_400_000);
   await db.query(
-    "INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3)",
-    [userId, hashToken(token), expiresAt]
+    "INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)",
+    [id, userId, hashToken(token), expiresAt]
   );
   (await cookies()).set(SESSION_COOKIE, token, {
     httpOnly: true,
@@ -36,7 +37,7 @@ export async function getCurrentUser() {
   const result = await db.query(
     `SELECT u.id, u.email, u.name FROM sessions s
      JOIN users u ON u.id = s.user_id
-     WHERE s.token_hash = $1 AND s.expires_at > NOW()` ,
+     WHERE s.token_hash = $1 AND s.expires_at > NOW()`,
     [hashToken(token)]
   );
   return result.rows[0] ?? null;
@@ -51,4 +52,3 @@ export async function destroyCurrentSession() {
   }
   store.delete(SESSION_COOKIE);
 }
-
