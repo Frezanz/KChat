@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { Sandbox } from "e2b";
+import { db } from "../../../lib/db";
+import { getCurrentUser } from "../../../lib/auth";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -169,16 +171,23 @@ async function previewStart(sandbox: Sandbox, body: Record<string, unknown>) {
   };
 }
 
-async function connectSandbox(id: string) {
+async function connectSandbox(id: string, userId: string) {
   if (!process.env.E2B_API_KEY)
     throw new Error(
       "E2B is not configured. Add E2B_API_KEY to the KChat deployment environment.",
     );
+  const ownership = await db.query(
+    "SELECT 1 FROM runtime_sandboxes WHERE sandbox_id = $1 AND user_id = $2",
+    [id, userId],
+  );
+  if (!ownership.rowCount) throw new Error("Sandbox is not owned by the current user.");
   return Sandbox.connect(id);
 }
 
 export async function POST(request: NextRequest) {
   try {
+    const user = await getCurrentUser();
+    if (!user) return NextResponse.json({ error: "Authentication required." }, { status: 401 });
     const body = await request.json();
     const action = String(body.action || "");
 
@@ -192,6 +201,10 @@ export async function POST(request: NextRequest) {
           { status: 503 },
         );
       const sandbox = await Sandbox.create();
+      await db.query(
+        "INSERT INTO runtime_sandboxes (sandbox_id, user_id) VALUES ($1, $2) ON CONFLICT (sandbox_id) DO NOTHING",
+        [sandbox.sandboxId, user.id],
+      );
       return NextResponse.json({
         sandboxId: sandbox.sandboxId,
         domain: sandbox.sandboxDomain,
@@ -204,7 +217,7 @@ export async function POST(request: NextRequest) {
         { error: "sandboxId is required" },
         { status: 400 },
       );
-    const sandbox = await connectSandbox(sandboxId);
+    const sandbox = await connectSandbox(sandboxId, user.id);
 
     if (action === "run") {
       const command = String(body.command || "").trim();
