@@ -37,7 +37,7 @@ type Role = "user" | "assistant";
 type Message = { id: string; role: Role; content: string };
 type ContextMode = "isolated" | "connected" | "global";
 type Chat = { id: string; title: string; messages: Message[]; updatedAt: number; contextMode: ContextMode; connectedChats: string[]; connectionIds: string[]; modelId?: string };
-type Settings = { model: string; system: string; temperature: number; enterToSend: boolean; showActivityLog: boolean; persistChats: boolean; persistSettings: boolean };
+type Settings = { model: string; system: string; temperature: number; maxOutputTokens: number; enterToSend: boolean; showActivityLog: boolean; persistChats: boolean; persistSettings: boolean };
 type ModelConnection = { id: string; name: string; provider: string; baseUrl: string; protocol: "responses" | "chat"; model: string; apiKey: string; authHeader: string; authPrefix: string };
 type ApiConnection = { id: string; kind: "api"; name: string; description: string; url: string; method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; headers: Record<string, string>; inputSchema: Record<string, unknown> };
 type McpConnection = { id: string; kind: "mcp"; name: string; description: string; serverUrl: string; headers: Record<string, string>; requireApproval: "always" | "never" };
@@ -53,6 +53,7 @@ const CONNECTIONS = "kchat-connections-v1";
 const DEFAULT_SETTINGS: Settings = {
   model: "gpt-6",
   temperature: 0.7,
+  maxOutputTokens: 4096,
   system: "You are KChat, a capable, thoughtful AI assistant. Be clear, useful, and concise.",
   enterToSend: true,
   showActivityLog: true,
@@ -355,7 +356,7 @@ export default function Home() {
   async function requestChatCompletion(chat: Chat, history: Message[], user: Message, controller: AbortController, model: ModelConnection) {
     const response = await fetch(modelEndpoint(model), {
       method: "POST", signal: controller.signal, headers: modelHeaders(model),
-      body: JSON.stringify({ model: model.model, messages: [{ role: "system", content: settings.system }, ...contextMessages(chat, history), user], temperature: settings.temperature, stream: true }),
+      body: JSON.stringify({ model: model.model, messages: [{ role: "system", content: settings.system }, ...contextMessages(chat, history), user], temperature: settings.temperature, max_tokens: settings.maxOutputTokens, stream: true }),
     });
     if (!response.ok) throw new Error(await modelError(response));
     if (!response.body) throw new Error("The model returned no stream.");
@@ -385,7 +386,7 @@ export default function Home() {
       const tools = attached.filter((item): item is ApiConnection => item.kind === "api").map((connection) => ({ type: "function", function: { name: toolName(connection), description: connection.description || `Call the ${connection.name} API.`, parameters: connection.inputSchema } }));
       let messages: any[] = [{ role: "system", content: settings.system }, ...contextMessages(chat, history), user];
       for (let round = 0; round < 8; round += 1) {
-        const response = await fetch(modelEndpoint(model), { method: "POST", signal: controller.signal, headers: modelHeaders(model), body: JSON.stringify({ model: model.model, messages, temperature: settings.temperature, ...(tools.length ? { tools, tool_choice: "auto" } : {}) }) });
+        const response = await fetch(modelEndpoint(model), { method: "POST", signal: controller.signal, headers: modelHeaders(model), body: JSON.stringify({ model: model.model, messages, temperature: settings.temperature, max_tokens: settings.maxOutputTokens, ...(tools.length ? { tools, tool_choice: "auto" } : {}) }) });
         if (!response.ok) throw new Error(await modelError(response));
         const data = await response.json(); const message = data.choices?.[0]?.message;
         if (!message) throw new Error("The model returned an empty response.");
@@ -405,7 +406,7 @@ export default function Home() {
     const input: any[] = [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content }));
     let previousResponseId: string | undefined;
     for (let round = 0; round < 8; round += 1) {
-      const body: Record<string, unknown> = { model: model.model, instructions: settings.system, input, temperature: settings.temperature, stream: false, parallel_tool_calls: false, ...(tools.length ? { tools } : {}) };
+      const body: Record<string, unknown> = { model: model.model, instructions: settings.system, input, temperature: settings.temperature, max_output_tokens: settings.maxOutputTokens, stream: false, parallel_tool_calls: false, ...(tools.length ? { tools } : {}) };
       if (previousResponseId) body.previous_response_id = previousResponseId;
       const response = await fetch(modelEndpoint(model), { method: "POST", signal: controller.signal, headers: modelHeaders(model), body: JSON.stringify(body) });
       if (!response.ok) throw new Error(await modelError(response));
@@ -976,6 +977,7 @@ export default function Home() {
             <label className="field"><span>Model ID</span><input value={settings.model} onChange={(e) => setSettings({ ...settings, model: e.target.value })} /><small>Use the exact model ID available to your API account.</small></label>
             <label className="field"><span>System instructions</span><textarea rows={5} value={settings.system} onChange={(e) => setSettings({ ...settings, system: e.target.value })} /></label>
             <label className="field range-field"><span>Temperature <b>{settings.temperature.toFixed(1)}</b></span><input type="range" min="0" max="1.5" step="0.1" value={settings.temperature} onChange={(e) => setSettings({ ...settings, temperature: Number(e.target.value) })} /></label>
+            <label className="field"><span>Max output tokens</span><input type="number" min="256" max="32768" step="256" value={settings.maxOutputTokens} onChange={(e) => setSettings({ ...settings, maxOutputTokens: Math.max(256, Math.min(32768, Number(e.target.value) || 4096)) })} /><small>Limits generated output. 4,096 is a practical default and avoids oversized credit reservations on providers such as OpenRouter.</small></label>
           </>}
           {settingsTab === "behavior" && <>
             <label className="setting-toggle"><span><strong>Enter to send</strong><small>Press Enter to send; Shift+Enter creates a new line.</small></span><input type="checkbox" checked={settings.enterToSend} onChange={(e) => setSettings({ ...settings, enterToSend: e.target.checked })} /></label>
