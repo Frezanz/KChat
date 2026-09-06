@@ -514,6 +514,11 @@ export default function Home() {
     let sandbox = sandboxId || sessionStorage.getItem("kchat-e2b-sandbox-id") || "";
     const transcript: string[] = [];
     const maxSteps = 10;
+    const runId = crypto.randomUUID();
+    const persistRun = (status: "running" | "waiting_approval" | "completed" | "failed", patch: Record<string, unknown> = {}) => {
+      void fetch("/api/agent-runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: runId, agentId: agent.id, agentName: agent.name, prompt, status, sandboxId: sandbox || null, step: Number(patch.step || 0), transcript, metadata: patch }) }).catch(() => undefined);
+    };
+    persistRun("running", { step: 0 });
     const hasConnector = agent.tools.some(tool => ["GitHub", "Netlify", "API tools"].includes(tool));
 
     if (agent.tools.includes("Code runtime")) {
@@ -534,6 +539,7 @@ export default function Home() {
       ...(agent.tools.includes("GitHub") ? ["github_list_repositories", "github_read_file", "github_write_file", "github_create_branch", "github_commit_multiple_files", "github_create_pull_request", "github_get_pull_request", "github_list_checks"] : []),
       ...(agent.tools.includes("Netlify") ? ["netlify_list_sites", "netlify_get_site", "netlify_list_deploys", "netlify_get_deploy", "netlify_trigger_build"] : []),
       ...(agent.tools.includes("API tools") ? customApis.map(connection => `custom_api:${connection.id}`) : []),
+      ...(agent.tools.includes("Code runtime") ? ["e2b_git_branch", "e2b_git_create_branch", "e2b_git_add", "e2b_git_commit", "e2b_git_push"] : []),
     ];
 
     async function executeAgentConnector(action: any) {
@@ -542,13 +548,15 @@ export default function Home() {
       const args = action.args && typeof action.args === "object" ? action.args : {};
       const destructive = tool.includes("write") || tool.includes("create_branch") || tool.includes("commit_multiple_files") || tool.includes("create_pull_request") || tool.includes("trigger_build");
       if (destructive && agent.approval !== "never") {
+        persistRun("waiting_approval", { step, tool, args });
         const approved = await new Promise<boolean>((resolve) => {
           agentApprovalResolver.current = resolve;
           setPendingAgentApproval({ tool, args });
         });
         setPendingAgentApproval(null);
         agentApprovalResolver.current = null;
-        if (!approved) throw new Error(`User denied approval for ${tool}.`);
+        if (!approved) { persistRun("failed", { step, error: `User denied approval for ${tool}.` }); throw new Error(`User denied approval for ${tool}.`); }
+        persistRun("running", { step });
       }
 
       if (tool.startsWith("custom_api:")) {
@@ -557,6 +565,19 @@ export default function Home() {
         const result = await executeApiConnection(connection, args, controller.signal);
         transcript.push(`API ${connection.name}:\n${JSON.stringify(result).slice(0, 12000)}`);
         return result;
+      }
+
+      if (tool.startsWith("e2b_git_")) {
+        const runtimeTool = tool.slice("e2b_".length);
+        const runtimeArgs: Record<string, unknown> = { action: runtimeTool, sandboxId: sandbox, directory: typeof args.directory === "string" && args.directory.trim() ? args.directory.trim() : "/workspace/repo" };
+        if (runtimeTool === "git_create_branch" || runtimeTool === "git_push") runtimeArgs.branch = required(args, "branch");
+        if (runtimeTool === "git_add") runtimeArgs.paths = Array.isArray(args.paths) ? args.paths : [];
+        if (runtimeTool === "git_commit") runtimeArgs.message = required(args, "message");
+        const response = await fetch("/api/runtime", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(runtimeArgs) });
+        const data = await response.json().catch(() => ({ error: "Invalid runtime response." }));
+        if (!response.ok) throw new Error(data?.error || `${tool} failed (${response.status})`);
+        transcript.push(`${tool}:\n${JSON.stringify(data).slice(0, 12000)}`);
+        return data;
       }
 
       if (tool.startsWith("github_") || tool.startsWith("netlify_")) {
@@ -579,7 +600,7 @@ export default function Home() {
 
     let task = prompt.trim();
     for (let step = 1; step <= maxSteps; step++) {
-      const instruction = `${agent.instructions}\n\nYou are operating as an autonomous coding/product agent. Step ${step}/${maxSteps}.\nAvailable configured tools: ${agent.tools.join(", ") || "none"}.\n${agent.tools.includes("Code runtime") ? "E2B runtime is available. You may inspect, edit and run the workspace." : "No code runtime is available."}\n${hasConnector ? `External connector tools available: ${enabledConnectorTools.join(", ")}. For custom APIs use tool=custom_api:<connectionId>. GitHub workflow: inspect the repository, create a feature branch with github_commit_multiple_files (base_branch=main), inspect the commit/diff, create a pull request, then use github_get_pull_request and github_list_checks to report CI status. Never merge automatically.` : "No external connectors are enabled."}\n${agent.tools.includes("Remote MCP") ? "Remote MCP is configured for normal KChat Responses requests, but this bounded JSON agent loop cannot directly approve MCP calls." : ""}\nReturn ONLY one JSON object with this shape: {"action":"read_file|write_file|run_command|list_files|search_files|git_status|git_diff|external_tool|done","path":"...","content":"...","command":"...","query":"...","tool":"...","args":{},"message":"..."}.\nUse read_file before editing when useful. Use write_file for complete file content. Use run_command for tests/builds. Use external_tool for GitHub, Netlify or configured API actions. When the task is complete, return action=done.\n\nTask: ${task}\n\nPrevious tool results:\n${transcript.slice(-8).join("\n")}`;
+      const instruction = `${agent.instructions}\n\nYou are operating as an autonomous coding/product agent. Step ${step}/${maxSteps}.\nAvailable configured tools: ${agent.tools.join(", ") || "none"}.\n${agent.tools.includes("Code runtime") ? "E2B runtime is available. You may inspect, edit and run the workspace." : "No code runtime is available."}\n${hasConnector ? `External connector tools available: ${enabledConnectorTools.join(", ")}. For custom APIs use tool=custom_api:<connectionId>. GitHub workflow: inspect the repository, create a feature branch with github_commit_multiple_files (base_branch=main), inspect the commit/diff, create a pull request, then use github_get_pull_request and github_list_checks to report CI status. Never merge automatically.` : "No external connectors are enabled."}\n${agent.tools.includes("Remote MCP") ? "Remote MCP is configured for normal KChat Responses requests, but this bounded JSON agent loop cannot directly approve MCP calls." : ""}\nReturn ONLY one JSON object with this shape: {"action":"read_file|write_file|run_command|list_files|search_files|git_status|git_diff|external_tool|done","path":"...","content":"...","command":"...","query":"...","tool":"...","args":{},"message":"..."}. For native E2B git operations use external_tool with tool=e2b_git_branch, e2b_git_create_branch, e2b_git_add, e2b_git_commit, or e2b_git_push and pass arguments in args. For a GitHub repository task, prefer importing the repo into E2B first, create a feature branch in E2B, make and test changes there, inspect git diff, then stage/commit/push only after approval.\nUse read_file before editing when useful. Use write_file for complete file content. Use run_command for tests/builds. Use external_tool for GitHub, Netlify or configured API actions. When the task is complete, return action=done.\n\nTask: ${task}\n\nPrevious tool results:\n${transcript.slice(-8).join("\n")}`;
       const reply = await requestChatCompletion(fakeChat, [], { id: `agent-${step}`, role: "user", content: instruction }, controller, model);
       const match = reply.match(/\{[\s\S]*\}/);
       if (!match) { transcript.push(`agent: ${reply.slice(0, 1000)}`); break; }
@@ -613,7 +634,16 @@ export default function Home() {
         const d = await r.json(); if (!r.ok) throw new Error(d.error || "read_file failed");
         transcript.push(`read ${action.path}:\n${String(d.content || "").slice(0, 10000)}`);
       } else if (action.action === "write_file") {
-        if (agent.approval !== "never") throw new Error("Approval required for file writes. Set this agent's approval policy to Never ask, or use an interactive approval flow.");
+        if (agent.approval !== "never") {
+          persistRun("waiting_approval", { step, tool: "e2b_write_file", path: String(action.path || "") });
+          const approved = await new Promise<boolean>((resolve) => {
+            agentApprovalResolver.current = resolve;
+            setPendingAgentApproval({ tool: "e2b_write_file", args: { sandboxId: sandbox, path: String(action.path || ""), content: String(action.content || "") } });
+          });
+          setPendingAgentApproval(null);
+          agentApprovalResolver.current = null;
+          if (!approved) throw new Error("User denied approval for e2b_write_file.");
+        }
         const r = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "write", sandboxId: sandbox, path: String(action.path || ""), content: String(action.content || "") }) });
         const d = await r.json(); if (!r.ok) throw new Error(d.error || "write_file failed"); transcript.push(`wrote ${action.path}`);
       } else if (action.action === "run_command") {
@@ -622,8 +652,10 @@ export default function Home() {
       } else {
         transcript.push(`unknown action: ${String(action.action)}`);
       }
+      persistRun("running", { step, lastAction: action.action });
       task = "Continue from the latest tool result. Inspect before changing anything, verify changes with tests or diffs, and finish only when the original task is satisfied.";
     }
+    persistRun("completed", { step: maxSteps });
     return transcript.join("\n\n") || "Agent finished without a transcript.";
   }
 
