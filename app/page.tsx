@@ -24,6 +24,9 @@ import {
   Trash2,
   UserRound,
   X,
+  Maximize2,
+  Minimize2,
+  LayoutGrid,
 } from "lucide-react";
 
 type Role = "user" | "assistant";
@@ -89,6 +92,12 @@ export default function Home() {
   const [toolsOpen, setToolsOpen] = useState(false);
   const [attachedName, setAttachedName] = useState("");
   const [attachedText, setAttachedText] = useState("");
+  const [gridOpen, setGridOpen] = useState(false);
+  const [gridIds, setGridIds] = useState<string[]>([]);
+  const [fullscreenId, setFullscreenId] = useState<string | null>(null);
+  const [gridDrafts, setGridDrafts] = useState<Record<string, string>>({});
+  const [gridSending, setGridSending] = useState<Record<string, boolean>>({});
+  const gridAbortRef = useRef<Record<string, AbortController | null>>({});
   const abortRef = useRef<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -114,6 +123,103 @@ export default function Home() {
     () => chats.filter((chat) => chat.title.toLowerCase().includes(query.toLowerCase())),
     [chats, query],
   );
+
+  function openGrid() {
+    setGridIds((prev) => {
+      if (prev.length) return prev;
+      return chats.slice(0, Math.min(4, chats.length)).map((chat) => chat.id);
+    });
+    setGridOpen(true);
+    setMobileOpen(false);
+  }
+
+  function addGridChat(id: string) {
+    setGridIds((prev) => prev.includes(id) || prev.length >= 4 ? prev : [...prev, id]);
+  }
+
+  function removeGridChat(id: string) {
+    if (fullscreenId === id) setFullscreenId(null);
+    setGridIds((prev) => prev.filter((item) => item !== id));
+  }
+
+  function updateChatById(chatId: string, messages: Message[], title?: string) {
+    setChats((prev) => prev.map((chat) => chat.id === chatId
+      ? { ...chat, messages, title: title ?? chat.title, updatedAt: Date.now() }
+      : chat));
+  }
+
+  async function sendGrid(chatId: string) {
+    const value = (gridDrafts[chatId] || "").trim();
+    if (!value || gridSending[chatId] || !apiKey) {
+      if (!apiKey) setKeyOpen(true);
+      return;
+    }
+    const chat = chats.find((item) => item.id === chatId);
+    if (!chat) return;
+    const history = chat.messages;
+    const user: Message = { id: uid(), role: "user", content: value };
+    const assistant: Message = { id: uid(), role: "assistant", content: "" };
+    const title = history.length ? chat.title : value.slice(0, 44);
+    setGridDrafts((prev) => ({ ...prev, [chatId]: "" }));
+    setGridSending((prev) => ({ ...prev, [chatId]: true }));
+    setError("");
+    updateChatById(chatId, [...history, user, assistant], title);
+    const controller = new AbortController();
+    gridAbortRef.current[chatId] = controller;
+    try {
+      const response = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        signal: controller.signal,
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model: settings.model,
+          instructions: settings.system,
+          input: [...history, user].map((message) => ({ role: message.role, content: message.content })),
+          temperature: settings.temperature,
+          stream: true,
+        }),
+      });
+      if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+      if (!response.body) throw new Error("The model returned no stream.");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let answer = "";
+      while (true) {
+        const { done, value: chunk } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(chunk, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() || "";
+        for (const event of events) {
+          const line = event.split("\n").find((item) => item.startsWith("data:"));
+          if (!line) continue;
+          const raw = line.slice(5).trim();
+          if (!raw || raw === "[DONE]") continue;
+          const data = JSON.parse(raw) as { type?: string; delta?: string; error?: { message?: string } };
+          if (data.type === "response.output_text.delta") {
+            answer += data.delta || "";
+            updateChatById(chatId, [...history, user, { ...assistant, content: answer }], title);
+          }
+          if (data.type === "error") throw new Error(data.error?.message || "Model error");
+        }
+      }
+      if (!answer) updateChatById(chatId, [...history, user, { ...assistant, content: "The model returned an empty response." }], title);
+    } catch (e) {
+      if ((e as Error).name !== "AbortError") {
+        setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320));
+        updateChatById(chatId, [...history, user], title);
+      }
+    } finally {
+      gridAbortRef.current[chatId] = null;
+      setGridSending((prev) => ({ ...prev, [chatId]: false }));
+    }
+  }
+
+  function stopGrid(chatId: string) {
+    gridAbortRef.current[chatId]?.abort();
+    setGridSending((prev) => ({ ...prev, [chatId]: false }));
+  }
 
   function newChat() {
     const chat = makeChat();
@@ -321,6 +427,7 @@ export default function Home() {
             </button>
           </div>
           <div className="top-right">
+            <button className={`top-link ${gridOpen ? "selected" : ""}`} onClick={() => gridOpen ? setGridOpen(false) : openGrid()}><LayoutGrid size={14} />{gridOpen ? "Single view" : "Grid"}</button>
             <button className="top-link" onClick={() => setKeyOpen(true)}><KeyRound size={14} />{apiKey ? "Connected" : "Connect"}</button>
             <button className="icon-btn" onClick={() => setMoreOpen(v => !v)}><MoreHorizontal size={18}/></button>
             <div className="mini-avatar">F</div>
@@ -328,8 +435,32 @@ export default function Home() {
           </div>
         </header>
 
-        <div className="conversation">
-          {active.messages.length === 0 ? (
+        <div className={`conversation ${gridOpen ? "grid-conversation" : ""}`}>
+          {gridOpen ? (
+            <div className="grid-workspace">
+              <div className="grid-toolbar">
+                <div><span className="eyebrow-inline"><i /> Parallel workspace</span><strong>{gridIds.length}/4 conversations running side by side</strong></div>
+                <div className="grid-toolbar-actions">
+                  <select value="" onChange={(e) => { if (e.target.value) addGridChat(e.target.value); }} aria-label="Add conversation to grid">
+                    <option value="">+ Add chat</option>
+                    {chats.filter((chat) => !gridIds.includes(chat.id)).map((chat) => <option key={chat.id} value={chat.id}>{chat.title}</option>)}
+                  </select>
+                  {gridIds.length > 0 && <button onClick={() => setGridIds([])}>Clear grid</button>}
+                </div>
+              </div>
+              {gridIds.length === 0 ? (
+                <div className="grid-empty"><LayoutGrid size={26}/><h2>Build your parallel workspace</h2><p>Add up to four conversations. Each chat has its own history, composer and generation stream.</p><button onClick={() => chats[0] && addGridChat(chats[0].id)}>Add first chat</button></div>
+              ) : (
+                <div className="chat-grid">
+                  {gridIds.map((id) => {
+                    const chat = chats.find((item) => item.id === id);
+                    if (!chat) return null;
+                    return <ChatTile key={id} chat={chat} sending={!!gridSending[id]} draft={gridDrafts[id] || ""} onDraft={(value) => setGridDrafts((prev) => ({ ...prev, [id]: value }))} onSend={() => sendGrid(id)} onStop={() => stopGrid(id)} onExpand={() => setFullscreenId(id)} onClose={() => removeGridChat(id)} />;
+                  })}
+                </div>
+              )}
+            </div>
+          ) : active.messages.length === 0 ? (
             <div className="welcome">
               <div className="orb-stage">
                 <div className="orb-ring ring-one" />
@@ -389,6 +520,12 @@ export default function Home() {
         </div>
       </section>
 
+      {fullscreenId && (() => {
+        const chat = chats.find((item) => item.id === fullscreenId);
+        if (!chat) return null;
+        return <div className="chat-fullscreen"><div className="fullscreen-head"><div><span className="eyebrow-inline"><i /> Focus mode</span><strong>{chat.title}</strong></div><button className="icon-btn" onClick={() => setFullscreenId(null)}><Minimize2 size={17}/></button></div><div className="fullscreen-body">{chat.messages.length ? chat.messages.map((message) => <div className={`message-row ${message.role}`} key={message.id}>{message.role === "assistant" && <div className="assistant-badge"><Sparkles size={14}/></div>}<div className="message-body">{message.role === "user" ? <div className="user-bubble">{message.content}</div> : <div className="assistant-text">{message.content || <span className="thinking"><i/><i/><i/></span>}</div>}</div></div>) : <div className="fullscreen-empty"><Sparkles size={25}/><p>This conversation is ready.</p></div>}</div><div className="fullscreen-composer"><textarea value={gridDrafts[chat.id] || ""} onChange={(e) => setGridDrafts((prev) => ({ ...prev, [chat.id]: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendGrid(chat.id); } }} placeholder="Continue this conversation…" rows={1}/>{gridSending[chat.id] ? <button className="send-btn stop" onClick={() => stopGrid(chat.id)}><Square size={13} fill="currentColor"/></button> : <button className="send-btn" onClick={() => sendGrid(chat.id)} disabled={!gridDrafts[chat.id]?.trim()}><ArrowUp size={17}/></button>}</div></div>;
+      })()}
+
       {keyOpen && (
         <Modal title="Connect your model" icon={<KeyRound size={17} />} onClose={() => setKeyOpen(false)}>
           <div className="modal-intro"><div className="intro-glow"><KeyRound size={20} /></div><div><strong>Bring your own key</strong><p>Your key stays in this browser session and is sent directly to the API. KChat never sends it to its own server.</p></div></div>
@@ -409,6 +546,14 @@ export default function Home() {
       )}
     </main>
   );
+}
+
+function ChatTile({ chat, sending, draft, onDraft, onSend, onStop, onExpand, onClose }: { chat: Chat; sending: boolean; draft: string; onDraft: (value: string) => void; onSend: () => void; onStop: () => void; onExpand: () => void; onClose: () => void }) {
+  return <article className="chat-tile">
+    <div className="chat-tile-head"><div className="chat-tile-title"><span className="tile-status" data-running={sending ? "true" : "false"}/><strong>{chat.title}</strong></div><div className="tile-actions"><button title="Expand" onClick={onExpand}><Maximize2 size={14}/></button><button title="Remove from grid" onClick={onClose}><X size={14}/></button></div></div>
+    <div className="tile-messages">{chat.messages.length === 0 ? <div className="tile-empty"><Sparkles size={19}/><span>Ready for a separate conversation.</span></div> : chat.messages.map((message) => <div className={`tile-message ${message.role}`} key={message.id}><span className="tile-role">{message.role === "user" ? "You" : "KChat"}</span><p>{message.content || <span className="thinking"><i/><i/><i/></span>}</p></div>)}</div>
+    <div className="tile-composer"><textarea value={draft} onChange={(e) => onDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); } }} placeholder="Message…" rows={1}/>{sending ? <button className="send-btn stop" onClick={onStop}><Square size={12} fill="currentColor"/></button> : <button className="send-btn" onClick={onSend} disabled={!draft.trim()}><ArrowUp size={15}/></button>}</div>
+  </article>;
 }
 
 function Modal({ title, icon, children, onClose }: { title: string; icon: React.ReactNode; children: React.ReactNode; onClose: () => void }) {
