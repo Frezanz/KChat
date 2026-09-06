@@ -358,6 +358,8 @@ export default function Home() {
       <div className="ambient ambient-two" />
       <div className="grain" />
 
+      {mobileOpen && <button className="mobile-backdrop" aria-label="Close menu" onClick={() => setMobileOpen(false)} />}
+
       <aside className={`sidebar ${collapsed ? "collapsed" : ""} ${mobileOpen ? "mobile-open" : ""}`}>
         <div className="brand-row">
           <div className="brand-logo"><Sparkles size={17} strokeWidth={2.2} /></div>
