@@ -27,7 +27,7 @@ function browserArg(value: unknown) {
 }
 async function runBrowserCli(sandbox: Sandbox, sandboxId: string, command: string, timeoutMs = 180000) {
   const env = { PLAYWRIGHT_CLI_SESSION: browserSessionName(sandboxId) };
-  return sandbox.commands.run(`npx -y @playwright/cli@latest ${command}`, { envs: env, timeoutMs });
+  return sandbox.commands.run(`npx -y -p @playwright/cli@latest playwright-cli ${command}`, { envs: env, timeoutMs });
 }
 function browserUrl(value: unknown) {
   const url = String(value || "").trim();
