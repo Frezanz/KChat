@@ -6,6 +6,8 @@ import {
   Check,
   ChevronDown,
   Copy,
+  Download,
+  FileText,
   KeyRound,
   Menu,
   MessageCircle,
@@ -83,8 +85,15 @@ export default function Home() {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [attachedName, setAttachedName] = useState("");
+  const [attachedText, setAttachedText] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!activeId && chats[0]) setActiveId(chats[0].id);
@@ -145,7 +154,8 @@ export default function Home() {
   }
 
   async function send(text = draft) {
-    const value = text.trim();
+    let value = text.trim();
+    if (attachedText) value += `\n\n[Attached file: ${attachedName}]\n${attachedText}`;
     if (!value || sending) return;
     if (!apiKey) {
       setKeyOpen(true);
@@ -234,6 +244,11 @@ export default function Home() {
     setKeyOpen(false);
   }
 
+  function clearActive() { setChats(prev => prev.map(c => c.id === active.id ? { ...c, messages: [], title: "New conversation", updatedAt: Date.now() } : c)); setDraft(""); setAttachedName(""); setAttachedText(""); setMoreOpen(false); }
+  function exportActive() { const text = `# ${active.title}\n\n` + active.messages.map(m => `## ${m.role === "user" ? "You" : "KChat"}\n\n${m.content}`).join("\n\n"); const blob = new Blob([text], { type: "text/markdown" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `${active.title.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "kchat"}.md`; a.click(); URL.revokeObjectURL(url); setMoreOpen(false); }
+  async function attach(file?: File) { if (!file) return; const ok = file.type.startsWith("text/") || /\.(txt|md|json|csv|js|jsx|ts|tsx|py|java|c|cpp|html|css|sql|xml|yaml|yml|sh|log)$/i.test(file.name); if (!ok) { setError("KChat currently accepts text and code files. PDF/image attachments can be added with the storage backend."); return; } if (file.size > 250000) { setError("Keep text attachments under 250 KB for browser-only mode."); return; } setAttachedName(file.name); setAttachedText(await file.text()); setError(""); }
+  function useQuickPrompt(prefix: string) { setDraft(prefix + (draft.trim() ? `\n\n${draft}` : "")); setToolsOpen(false); textareaRef.current?.focus(); }
+
   async function copy(text: string, id: string) {
     try {
       await navigator.clipboard.writeText(text);
@@ -307,7 +322,9 @@ export default function Home() {
           </div>
           <div className="top-right">
             <button className="top-link" onClick={() => setKeyOpen(true)}><KeyRound size={14} />{apiKey ? "Connected" : "Connect"}</button>
+            <button className="icon-btn" onClick={() => setMoreOpen(v => !v)}><MoreHorizontal size={18}/></button>
             <div className="mini-avatar">F</div>
+            {moreOpen && <div className="more-menu"><button onClick={exportActive}><Download size={14}/> Export chat</button><button onClick={clearActive}><Trash2 size={14}/> Clear conversation</button></div>}
           </div>
         </header>
 
@@ -361,10 +378,11 @@ export default function Home() {
         <div className="composer-area">
           <div className="composer-glow" />
           <div className="composer">
-            <textarea value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} placeholder="Message KChat…" rows={1} />
+            {attachedName && <div className="attachment-chip"><FileText size={13}/><span>{attachedName}</span><button onClick={() => {setAttachedName("");setAttachedText("");}}><X size={12}/></button></div>}
+            <textarea ref={textareaRef} value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} placeholder="Message KChat…" rows={1} />
             <div className="composer-bottom">
-              <div className="composer-left"><button><Paperclip size={17} /></button><button><Plus size={18} /></button><span className="composer-model">{settings.model}</span></div>
-              <div className="composer-right"><span className="connection-label"><i />{apiKey ? "Ready" : "API key required"}</span>{sending ? <button className="send-btn stop" onClick={stop}><Square size={13} fill="currentColor" /></button> : <button className="send-btn" onClick={() => send()} disabled={!draft.trim()}><ArrowUp size={17} /></button>}</div>
+              <div className="composer-left"><input ref={fileRef} type="file" hidden onChange={e => { attach(e.target.files?.[0]); e.currentTarget.value=""; }}/><button title="Attach file" onClick={() => fileRef.current?.click()}><Paperclip size={17}/></button><div className="tools-wrap"><button title="Quick tools" onClick={() => { setToolsOpen(v=>!v); setMoreOpen(false); }}><Plus size={18}/></button>{toolsOpen && <div className="tools-menu"><button onClick={() => useQuickPrompt("Improve this prompt:")}><Sparkles size={13}/> Improve prompt</button><button onClick={() => useQuickPrompt("Explain this simply:")}><Sparkles size={13}/> Explain simply</button><button onClick={() => useQuickPrompt("Brainstorm 10 strong ideas for:")}><Sparkles size={13}/> Brainstorm</button></div>}</div><span className="composer-model">{settings.model}</span></div>
+              <div className="composer-right"><span className="connection-label"><i />{apiKey ? "Ready" : "API key required"}</span>{sending ? <button className="send-btn stop" onClick={stop}><Square size={13} fill="currentColor" /></button> : <button className="send-btn" onClick={() => send()} disabled={!draft.trim() && !attachedText}><ArrowUp size={17} /></button>}</div>
             </div>
           </div>
           <p className="disclaimer">KChat may make mistakes. Requests are sent directly from your browser using your own API key.</p>
