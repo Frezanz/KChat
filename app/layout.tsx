@@ -1,11 +1,14 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { getCurrentUser } from "../lib/auth";
+import AuthScreen from "./components/AuthScreen";
 
 export const metadata: Metadata = {
   title: "KChat — Private AI Workspace",
-  description: "A focused AI workspace powered by your own API key.",
+  description: "A premium, local-first AI workspace with BYOK.",
 };
 
-export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en"><body>{children}</body></html>;
+export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+  const user = await getCurrentUser();
+  return <html lang="en"><body>{user ? children : <AuthScreen />}</body></html>;
 }
