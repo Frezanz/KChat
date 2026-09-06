@@ -995,7 +995,6 @@ export default function Home() {
           </div>
           <p className="disclaimer">KChat may make mistakes. Requests are sent directly from your browser using your own API key.</p>
         </div>
-        </>
         ) : workspaceMode === "code" ? <CodeWorkspace
           project={codeProject}
           file={codeFile}
