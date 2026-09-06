@@ -25,6 +25,22 @@ export async function POST(request: NextRequest) {
     const tool = body.tool;
     if (!tool) return jsonError("tool is required");
 
+    if (tool.startsWith("e2b_git_")) {
+      const sandboxId = required(args, "sandboxId");
+      const action = tool.slice("e2b_".length);
+      const payload: Record<string, unknown> = { action, sandboxId, directory: token(args.directory) || "/workspace/repo" };
+      if (action === "git_create_branch" || action === "git_push") payload.branch = required(args, "branch");
+      if (action === "git_commit") payload.message = required(args, "message");
+      if (action === "git_add") payload.paths = Array.isArray(args.paths) ? args.paths : [];
+      if (action === "git_push") payload.githubToken = githubToken;
+      const runtimeUrl = new URL("/api/runtime", request.url);
+      const response = await fetch(runtimeUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const text = await response.text();
+      let data: unknown; try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+      if (!response.ok) return NextResponse.json(data, { status: response.status });
+      return NextResponse.json(data);
+    }
+
     if (tool.startsWith("github_")) {
       if (!githubToken) return jsonError("Connect GitHub first.", 401);
       if (tool === "github_list_repositories" && token(args.action) === "import_to_e2b") {

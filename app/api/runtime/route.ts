@@ -11,6 +11,14 @@ function cleanWorkspacePath(value: string) {
   return path.startsWith("/") ? path : `/${path}`;
 }
 
+function shellQuote(value: string) {
+  return "'" + value.replace(/'/g, "'\"'\"'") + "'";
+}
+
+function gitWorkspacePath(value: unknown) {
+  return cleanWorkspacePath(String(value || "/workspace/repo"));
+}
+
 async function connectSandbox(id: string) {
   if (!process.env.E2B_API_KEY) throw new Error("E2B is not configured. Add E2B_API_KEY to the KChat deployment environment.");
   return Sandbox.connect(id);
@@ -67,6 +75,60 @@ export async function POST(request: NextRequest) {
       await sandbox.commands.run(`rm -rf '${escaped}'; mkdir -p /workspace; git clone --origin origin --no-tags ${ref ? `--branch '${ref.replace(/'/g, "'\"'\"'")}' ` : ""}${cloneUrl} '${escaped}'`, { envs, timeoutMs: 300000 });
       if (token) await sandbox.commands.run("rm -f /tmp/kchat-askpass.sh");
       return NextResponse.json({ ok: true, sandboxId, directory, repoUrl: cloneUrl, ref: ref || null });
+    }
+
+    if (action === "git_branch") {
+      const cwd = gitWorkspacePath(body.directory);
+      const result = await sandbox.commands.run(`cd ${shellQuote(cwd)} && git branch --show-current`, { timeoutMs: 120000 });
+      return NextResponse.json({ stdout: result.stdout || "", stderr: result.stderr || "", exitCode: result.exitCode ?? 0 });
+    }
+
+    if (action === "git_create_branch") {
+      const cwd = gitWorkspacePath(body.directory);
+      const branch = String(body.branch || "").trim();
+      if (!branch) return NextResponse.json({ error: "branch is required" }, { status: 400 });
+      if (!/^[A-Za-z0-9._\/-]+$/.test(branch) || branch.includes("..") || branch.startsWith("/") || branch.endsWith("/")) {
+        return NextResponse.json({ error: "invalid branch name" }, { status: 400 });
+      }
+      const result = await sandbox.commands.run(`cd ${shellQuote(cwd)} && git switch -c ${shellQuote(branch)}`, { timeoutMs: 120000 });
+      return NextResponse.json({ stdout: result.stdout || "", stderr: result.stderr || "", exitCode: result.exitCode ?? 0, branch });
+    }
+
+    if (action === "git_add") {
+      const cwd = gitWorkspacePath(body.directory);
+      const paths = Array.isArray(body.paths) ? body.paths.map((value: unknown) => cleanWorkspacePath(String(value))).filter(Boolean) : [];
+      const command = paths.length ? `cd ${shellQuote(cwd)} && git add -- ${paths.map(shellQuote).join(" ")}` : `cd ${shellQuote(cwd)} && git add -A`;
+      const result = await sandbox.commands.run(command, { timeoutMs: 120000 });
+      return NextResponse.json({ stdout: result.stdout || "", stderr: result.stderr || "", exitCode: result.exitCode ?? 0 });
+    }
+
+    if (action === "git_commit") {
+      const cwd = gitWorkspacePath(body.directory);
+      const message = String(body.message || "").trim();
+      if (!message) return NextResponse.json({ error: "message is required" }, { status: 400 });
+      const result = await sandbox.commands.run(`cd ${shellQuote(cwd)} && git commit -m ${shellQuote(message)}`, { timeoutMs: 120000 });
+      return NextResponse.json({ stdout: result.stdout || "", stderr: result.stderr || "", exitCode: result.exitCode ?? 0 });
+    }
+
+    if (action === "git_push") {
+      const cwd = gitWorkspacePath(body.directory);
+      const branch = String(body.branch || "").trim();
+      const token = String(body.githubToken || "").trim();
+      if (!branch) return NextResponse.json({ error: "branch is required" }, { status: 400 });
+      if (!token) return NextResponse.json({ error: "githubToken is required" }, { status: 401 });
+      if (!/^[A-Za-z0-9._\/-]+$/.test(branch) || branch.includes("..") || branch.startsWith("/") || branch.endsWith("/")) {
+        return NextResponse.json({ error: "invalid branch name" }, { status: 400 });
+      }
+      const askpass = "/tmp/kchat-askpass.sh";
+      const envs = { GITHUB_TOKEN: token, GIT_ASKPASS: askpass, GIT_TERMINAL_PROMPT: "0" };
+      await sandbox.files.write(askpass, '#!/bin/sh\nprintf '%s\n' "$GITHUB_TOKEN"\n');
+      await sandbox.commands.run(`chmod 700 ${shellQuote(askpass)}`);
+      try {
+        const result = await sandbox.commands.run(`cd ${shellQuote(cwd)} && git push --set-upstream origin ${shellQuote(branch)}`, { envs, timeoutMs: 180000 });
+        return NextResponse.json({ stdout: result.stdout || "", stderr: result.stderr || "", exitCode: result.exitCode ?? 0, branch });
+      } finally {
+        await sandbox.commands.run(`rm -f ${shellQuote(askpass)}`);
+      }
     }
 
     if (action === "git_snapshot") {
