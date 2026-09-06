@@ -37,7 +37,7 @@ type Role = "user" | "assistant";
 type Message = { id: string; role: Role; content: string };
 type ContextMode = "isolated" | "connected" | "global";
 type Chat = { id: string; title: string; messages: Message[]; updatedAt: number; contextMode: ContextMode; connectedChats: string[]; connectionIds: string[]; modelId?: string };
-type Settings = { model: string; system: string; temperature: number };
+type Settings = { model: string; system: string; temperature: number; enterToSend: boolean; showActivityLog: boolean; persistChats: boolean; persistSettings: boolean };
 type ModelConnection = { id: string; name: string; provider: string; baseUrl: string; protocol: "responses" | "chat"; model: string; apiKey: string; authHeader: string; authPrefix: string };
 type ApiConnection = { id: string; kind: "api"; name: string; description: string; url: string; method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; headers: Record<string, string>; inputSchema: Record<string, unknown> };
 type McpConnection = { id: string; kind: "mcp"; name: string; description: string; serverUrl: string; headers: Record<string, string>; requireApproval: "always" | "never" };
@@ -46,6 +46,7 @@ type Connection = ApiConnection | McpConnection;
 const KEY = "kchat-api-key";
 const MODEL_CONNECTIONS = "kchat-model-connections-v1";
 const ACTIVE_MODEL = "kchat-active-model-v1";
+const GRID_MAX = 16;
 const CHATS = "kchat-chats-v3";
 const SETTINGS = "kchat-settings-v3";
 const CONNECTIONS = "kchat-connections-v1";
@@ -53,6 +54,10 @@ const DEFAULT_SETTINGS: Settings = {
   model: "gpt-6",
   temperature: 0.7,
   system: "You are KChat, a capable, thoughtful AI assistant. Be clear, useful, and concise.",
+  enterToSend: true,
+  showActivityLog: true,
+  persistChats: true,
+  persistSettings: true,
 };
 
 
@@ -91,10 +96,10 @@ async function modelError(response: Response) {
 }
 
 const starters = [
-  { icon: "â¦", title: "Create something", text: "Help me turn an idea into a useful product. Start by asking the most important questions." },
-  { icon: "â", title: "Learn deeply", text: "Teach me a difficult concept from first principles, with intuition, examples, and a practical exercise." },
-  { icon: "â", title: "Think clearly", text: "Challenge my assumptions and help me reason through a difficult decision without sugarcoating it." },
-  { icon: "â", title: "Build a plan", text: "Build me a realistic step-by-step plan for achieving an ambitious goal with limited resources." },
+  { icon: "✦", title: "Create something", text: "Help me turn an idea into a useful product. Start by asking the most important questions." },
+  { icon: "◈", title: "Learn deeply", text: "Teach me a difficult concept from first principles, with intuition, examples, and a practical exercise." },
+  { icon: "⌁", title: "Think clearly", text: "Challenge my assumptions and help me reason through a difficult decision without sugarcoating it." },
+  { icon: "↗", title: "Build a plan", text: "Build me a realistic step-by-step plan for achieving an ambitious goal with limited resources." },
 ];
 
 function uid() {
@@ -123,7 +128,8 @@ function getKey() {
 export default function Home() {
   const [chats, setChats] = useState<Chat[]>(() => load(CHATS, [makeChat()]));
   const [activeId, setActiveId] = useState("");
-  const [settings, setSettings] = useState<Settings>(() => load(SETTINGS, DEFAULT_SETTINGS));
+  const [settings, setSettings] = useState<Settings>(() => ({ ...DEFAULT_SETTINGS, ...load(SETTINGS, {}) }));
+  const [settingsTab, setSettingsTab] = useState<"model" | "behavior" | "privacy">("model");
   const [apiKey, setApiKey] = useState("");
   const [modelConnections, setModelConnections] = useState<ModelConnection[]>([]);
   const [activeModelId, setActiveModelId] = useState("");
@@ -207,8 +213,9 @@ export default function Home() {
   }, [chats, activeId]);
 
   useEffect(() => {
-    localStorage.setItem(CHATS, JSON.stringify(chats));
-  }, [chats]);
+    if (settings.persistChats) localStorage.setItem(CHATS, JSON.stringify(chats));
+    else localStorage.removeItem(CHATS);
+  }, [chats, settings.persistChats]);
 
   useEffect(() => {
     if (activeId) {
@@ -217,7 +224,8 @@ export default function Home() {
   }, [activeId]);
 
   useEffect(() => {
-    localStorage.setItem(SETTINGS, JSON.stringify(settings));
+    if (settings.persistSettings) localStorage.setItem(SETTINGS, JSON.stringify(settings));
+    else localStorage.removeItem(SETTINGS);
   }, [settings]);
 
   const active = chats.find((chat) => chat.id === activeId) || chats[0] || makeChat();
@@ -233,14 +241,14 @@ export default function Home() {
   function openGrid() {
     setGridIds((prev) => {
       if (prev.length) return prev;
-      return chats.slice(0, Math.min(4, chats.length)).map((chat) => chat.id);
+      return chats.slice(0, Math.min(GRID_MAX, chats.length)).map((chat) => chat.id);
     });
     setGridOpen(true);
     setMobileOpen(false);
   }
 
   function addGridChat(id: string) {
-    setGridIds((prev) => prev.includes(id) || prev.length >= 4 ? prev : [...prev, id]);
+    setGridIds((prev) => prev.includes(id) || prev.length >= GRID_MAX ? prev : [...prev, id]);
   }
 
   function removeGridChat(id: string) {
@@ -471,7 +479,7 @@ export default function Home() {
     const chat = chats.find((item) => item.id === activeId); if (!chat || sending[chat.id]) return;
     const model = modelForChat(chat);
     if (!model) { setKeyOpen(true); return; }
-    setDraft(""); setError(""); addActivityLog("info", `${activeModel.provider} request started Â· ${activeModel.model}`); setSending((prev) => ({ ...prev, [chat.id]: true }));
+    setDraft(""); setError(""); addActivityLog("info", `${activeModel.provider} request started · ${activeModel.model}`); setSending((prev) => ({ ...prev, [chat.id]: true }));
     const user: Message = { id: uid(), role: "user", content: value };
     const assistant: Message = { id: uid(), role: "assistant", content: "" };
     const history = chat.messages; const title = history.length ? chat.title : value.slice(0, 44);
@@ -545,7 +553,7 @@ export default function Home() {
     const body = connection.protocol === "responses"
       ? { model: connection.model, input: "Reply with OK.", max_output_tokens: 1, stream: false }
       : { model: connection.model, messages: [{ role: "user", content: "Reply with OK." }], max_tokens: 1, stream: false };
-    addActivityLog("info", `Testing ${connection.provider} Â· ${connection.model}â¦`);
+    addActivityLog("info", `Testing ${connection.provider} · ${connection.model}…`);
     const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(body) });
     if (!response.ok) throw new Error(await modelError(response));
     const data = await response.json();
@@ -637,7 +645,17 @@ export default function Home() {
   }
 
   function clearActive() { setChats(prev => prev.map(c => c.id === active.id ? { ...c, messages: [], title: "New conversation", updatedAt: Date.now() } : c)); setDraft(""); setAttachedName(""); setAttachedText(""); }
-  function exportActive() { const text = `# ${active.title}\n\n` + active.messages.map(m => `## ${m.role === "user" ? "You" : "KChat"}\n\n${m.content}`).join("\n\n"); const blob = new Blob([text], { type: "text/markdown" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = `${active.title.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "kchat"}.md`; a.click(); URL.revokeObjectURL(url); }
+  function exportChat(chat: Chat) {
+    const text = `# ${chat.title}\n\n` + chat.messages.map(m => `## ${m.role === "user" ? "You" : "KChat"}\n\n${m.content}`).join("\n\n");
+    const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${chat.title.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "kchat"}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  function exportActive() { exportChat(active); }
   async function attach(file?: File) { if (!file) return; const ok = file.type.startsWith("text/") || /\.(txt|md|json|csv|js|jsx|ts|tsx|py|java|c|cpp|html|css|sql|xml|yaml|yml|sh|log)$/i.test(file.name); if (!ok) { setError("KChat currently accepts text and code files. PDF/image attachments can be added with the storage backend."); return; } if (file.size > 250000) { setError("Keep text attachments under 250 KB for browser-only mode."); return; } setAttachedName(file.name); setAttachedText(await file.text()); setError(""); }
   function useQuickPrompt(prefix: string) { setDraft(prefix + (draft.trim() ? `\n\n${draft}` : "")); setToolsOpen(false); textareaRef.current?.focus(); }
 
@@ -690,14 +708,14 @@ export default function Home() {
         <button className="new-chat" onClick={newChat}>
           <span className="new-chat-icon"><Plus size={17} /></span>
           {!collapsed && <span>New chat</span>}
-          {!collapsed && <kbd>â K</kbd>}
+          {!collapsed && <kbd>⌘ K</kbd>}
         </button>
 
         {!collapsed && (
           <div className="search-box">
             <Search size={15} />
             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search conversations" />
-            <span className="search-key">â</span>
+            <span className="search-key">⌘</span>
           </div>
         )}
 
@@ -707,6 +725,7 @@ export default function Home() {
             <button className={`chat-item ${chat.id === active.id ? "active" : ""}`} key={chat.id} onClick={() => selectChat(chat.id)}>
               <MessageCircle size={15} />
               {!collapsed && <span>{chat.title}</span>}
+              {!collapsed && <Download className="chat-export" size={14} onClick={(e) => { e.stopPropagation(); exportChat(chat); }} aria-label={`Export ${chat.title}`} />}
               {!collapsed && <Trash2 className="chat-delete" size={14} onClick={(e) => { e.stopPropagation(); deleteChat(chat.id); }} />}
             </button>
           ))}
@@ -716,20 +735,18 @@ export default function Home() {
           <div className="profile-workspace">
             <button className={`workspace-card profile-workspace-trigger ${profileOpen ? "selected" : ""}`} onClick={() => setProfileOpen(v => !v)} aria-label="Personal workspace profile" title="Personal workspace">
               <div className="avatar"><UserRound size={15} /></div>
-              {!collapsed && <div className="workspace-copy"><strong>Personal workspace</strong><small>{profileUser ? profileUser.email : (apiKey ? "Connected â¢ BYOK" : "Private â¢ BYOK")}</small></div>}
+              {!collapsed && <div className="workspace-copy"><strong>Personal workspace</strong><small>{profileUser ? profileUser.email : (apiKey ? "Connected • BYOK" : "Private • BYOK")}</small></div>}
               <MoreHorizontal size={16} />
             </button>
             {profileOpen && <div className="profile-menu workspace-profile-menu">
               {profileUser ? <>
                 <div className="profile-menu-user"><div className="profile-menu-avatar"><UserRound size={16}/></div><div><strong>{profileUser.email}</strong><span>Signed in</span></div></div>
                 <button onClick={() => { setProfileOpen(false); setIntegrationsOpen(true); }}><Plug size={14}/> Connections</button>
-                <button onClick={() => { setProfileOpen(false); exportActive(); }}><Download size={14}/> Export chat</button>
                 <button onClick={() => { setProfileOpen(false); clearActive(); }}><Trash2 size={14}/> Clear conversation</button>
                 <button onClick={async () => { await fetch("/api/auth/logout", { method: "POST" }); window.location.reload(); }}><UserRound size={14}/> Sign out</button>
               </> : <>
                 <div className="profile-menu-head"><strong>Welcome to KChat</strong><span>Sign in to sync your workspace.</span></div>
                 <button onClick={() => { setProfileOpen(false); setIntegrationsOpen(true); }}><Plug size={14}/> Connections</button>
-                <button onClick={() => { setProfileOpen(false); exportActive(); }}><Download size={14}/> Export chat</button>
                 <button onClick={() => { setProfileOpen(false); clearActive(); }}><Trash2 size={14}/> Clear conversation</button>
                 <button onClick={() => { window.location.href = "?auth=login"; }}><UserRound size={14}/> Sign in</button>
                 <button onClick={() => { window.location.href = "?auth=signup"; }}><UserRound size={14}/> Create account</button>
@@ -764,7 +781,7 @@ export default function Home() {
           {gridOpen ? (
             <div className="grid-workspace">
               <div className="grid-toolbar">
-                <div><span className="eyebrow-inline"><i /> Parallel workspace</span><strong>{gridIds.length}/4 conversations running side by side</strong></div>
+                <div><span className="eyebrow-inline"><i /> Parallel workspace</span><strong>{gridIds.length}/{GRID_MAX} conversations ready to run side by side</strong></div>
                 <div className="grid-toolbar-actions">
                   <button onClick={runAllGridChats} disabled={!gridIds.some((id) => (gridDrafts[id] || "").trim() && !gridSending[id])}>Run all</button>
                   <select value="" onChange={(e) => { if (e.target.value) addGridChat(e.target.value); }} aria-label="Add conversation to grid">
@@ -775,13 +792,13 @@ export default function Home() {
                 </div>
               </div>
               {gridIds.length === 0 ? (
-                <div className="grid-empty"><LayoutGrid size={26}/><h2>Build your parallel workspace</h2><p>Add up to four conversations. Each chat has its own history, composer and generation stream.</p><button onClick={() => chats[0] && addGridChat(chats[0].id)}>Add first chat</button></div>
+                <div className="grid-empty"><LayoutGrid size={26}/><h2>Build your parallel workspace</h2><p>Add up to sixteen conversations. Each chat has its own history, composer and independent generation stream.</p><button onClick={() => chats[0] && addGridChat(chats[0].id)}>Add first chat</button></div>
               ) : (
                 <div className="chat-grid">
                   {gridIds.map((id) => {
                     const chat = chats.find((item) => item.id === id);
                     if (!chat) return null;
-                    return <ChatTile key={id} chat={chat} model={modelForChat(chat)} models={modelConnections} sending={!!gridSending[id]} draft={gridDrafts[id] || ""} onModel={(modelId) => setChatModel(id, modelId)} onDraft={(value) => setGridDrafts((prev) => ({ ...prev, [id]: value }))} onSend={() => sendGrid(id)} onStop={() => stopGrid(id)} onExpand={() => setFullscreenId(id)} onClose={() => removeGridChat(id)} />;
+                    return <ChatTile key={id} chat={chat} model={modelForChat(chat)} models={modelConnections} sending={!!gridSending[id]} draft={gridDrafts[id] || ""} onModel={(modelId) => setChatModel(id, modelId)} onDraft={(value) => setGridDrafts((prev) => ({ ...prev, [id]: value }))} onSend={() => sendGrid(id)} onStop={() => stopGrid(id)} onExpand={() => setFullscreenId(id)} onExport={() => exportChat(chat)} onClose={() => removeGridChat(id)} />;
                   })}
                 </div>
               )}
@@ -835,7 +852,7 @@ export default function Home() {
         </div>
 
         <div className="composer-area">
-          {activityLogs.length > 0 && <div className="activity-log" role="log" aria-label="Request activity log">
+          {settings.showActivityLog && activityLogs.length > 0 && <div className="activity-log" role="log" aria-label="Request activity log">
             <div className="activity-log-head"><span><i />Activity log</span><button onClick={() => setActivityLogs([])}>Clear</button></div>
             <div className="activity-log-list">{activityLogs.map((entry) => <div className={`activity-log-entry ${entry.type}`} key={entry.id}><time>{entry.time}</time><span>{entry.text}</span></div>)}</div>
           </div>}
@@ -843,10 +860,10 @@ export default function Home() {
           <div className="composer">
             {attachedName && <div className="attachment-chip"><FileText size={13}/><span>{attachedName}</span><button onClick={() => {setAttachedName("");setAttachedText("");}}><X size={12}/></button></div>}
             {attachedConnections(active).length > 0 && <div className="connection-chips">{attachedConnections(active).map((connection) => <button key={connection.id} className="connection-chip" onClick={() => setIntegrationsOpen(true)} title="Manage chat connections"><Plug size={12}/><span>{connection.name}</span><X size={11}/></button>)}</div>}
-            <textarea ref={textareaRef} value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} placeholder="Message KChatâ¦" rows={1} />
+            <textarea ref={textareaRef} value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && settings.enterToSend) { e.preventDefault(); send(); } }} placeholder="Message KChat…" rows={1} />
             <div className="composer-bottom">
               <div className="composer-left"><input ref={fileRef} type="file" hidden onChange={e => { attach(e.target.files?.[0]); e.currentTarget.value=""; }}/><button title="Attach file" onClick={() => fileRef.current?.click()}><Paperclip size={17}/></button><div className="tools-wrap"><button title="Connect API or MCP" onClick={() => setIntegrationsOpen(true)}><Plug size={16}/></button><button title="Quick tools" onClick={() => { setToolsOpen(v=>!v); }}><Plus size={18}/></button>{toolsOpen && <div className="tools-menu"><button onClick={() => useQuickPrompt("Improve this prompt:")}><Sparkles size={13}/> Improve prompt</button><button onClick={() => useQuickPrompt("Explain this simply:")}><Sparkles size={13}/> Explain simply</button><button onClick={() => useQuickPrompt("Brainstorm 10 strong ideas for:")}><Sparkles size={13}/> Brainstorm</button></div>}</div><span className="composer-model">{activeModel?.model || settings.model}</span></div>
-              <div className="composer-right"><span className="connection-label"><i />{activeModel ? `${activeModel.provider} â¢ Ready` : "Connect a model"}</span>{sending[active.id] ? <button className="send-btn stop" onClick={() => stop(active.id)}><Square size={13} fill="currentColor" /></button> : <button className="send-btn" onClick={() => send()} disabled={!draft.trim() && !attachedText}><ArrowUp size={17} /></button>}</div>
+              <div className="composer-right"><span className="connection-label"><i />{activeModel ? `${activeModel.provider} • Ready` : "Connect a model"}</span>{sending[active.id] ? <button className="send-btn stop" onClick={() => stop(active.id)}><Square size={13} fill="currentColor" /></button> : <button className="send-btn" onClick={() => send()} disabled={!draft.trim() && !attachedText}><ArrowUp size={17} /></button>}</div>
             </div>
           </div>
           <p className="disclaimer">KChat may make mistakes. Requests are sent directly from your browser using your own API key.</p>
@@ -856,7 +873,7 @@ export default function Home() {
       {fullscreenId && (() => {
         const chat = chats.find((item) => item.id === fullscreenId);
         if (!chat) return null;
-        return <div className="chat-fullscreen"><div className="fullscreen-head"><div><span className="eyebrow-inline"><i /> Focus mode</span><strong>{chat.title}</strong></div><button className="icon-btn" onClick={() => setFullscreenId(null)}><Minimize2 size={17}/></button></div><div className="fullscreen-body">{chat.messages.length ? chat.messages.map((message) => <div className={`message-row ${message.role}`} key={message.id}>{message.role === "assistant" && <div className="assistant-badge"><Sparkles size={14}/></div>}<div className="message-body">{message.role === "user" ? <div className="user-bubble">{message.content}</div> : <div className="assistant-text">{message.content || <span className="thinking"><i/><i/><i/></span>}</div>}</div></div>) : <div className="fullscreen-empty"><Sparkles size={25}/><p>This conversation is ready.</p></div>}</div><div className="fullscreen-composer"><textarea value={gridDrafts[chat.id] || ""} onChange={(e) => setGridDrafts((prev) => ({ ...prev, [chat.id]: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendGrid(chat.id); } }} placeholder="Continue this conversationâ¦" rows={1}/>{gridSending[chat.id] ? <button className="send-btn stop" onClick={() => stopGrid(chat.id)}><Square size={13} fill="currentColor"/></button> : <button className="send-btn" onClick={() => sendGrid(chat.id)} disabled={!gridDrafts[chat.id]?.trim()}><ArrowUp size={17}/></button>}</div></div>;
+        return <div className="chat-fullscreen"><div className="fullscreen-head"><div><span className="eyebrow-inline"><i /> Focus mode</span><strong>{chat.title}</strong></div><button className="icon-btn" onClick={() => setFullscreenId(null)}><Minimize2 size={17}/></button></div><div className="fullscreen-body">{chat.messages.length ? chat.messages.map((message) => <div className={`message-row ${message.role}`} key={message.id}>{message.role === "assistant" && <div className="assistant-badge"><Sparkles size={14}/></div>}<div className="message-body">{message.role === "user" ? <div className="user-bubble">{message.content}</div> : <div className="assistant-text">{message.content || <span className="thinking"><i/><i/><i/></span>}</div>}</div></div>) : <div className="fullscreen-empty"><Sparkles size={25}/><p>This conversation is ready.</p></div>}</div><div className="fullscreen-composer"><textarea value={gridDrafts[chat.id] || ""} onChange={(e) => setGridDrafts((prev) => ({ ...prev, [chat.id]: e.target.value }))} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendGrid(chat.id); } }} placeholder="Continue this conversation…" rows={1}/>{gridSending[chat.id] ? <button className="send-btn stop" onClick={() => stopGrid(chat.id)}><Square size={13} fill="currentColor"/></button> : <button className="send-btn" onClick={() => sendGrid(chat.id)} disabled={!gridDrafts[chat.id]?.trim()}><ArrowUp size={17}/></button>}</div></div>;
       })()}
 
       {chatSettingsId && (() => {
@@ -886,14 +903,14 @@ export default function Home() {
       {keyOpen && (
         <Modal title="Connect a model API" icon={<KeyRound size={17} />} onClose={() => setKeyOpen(false)}>
           <div className="modal-intro"><div className="intro-glow"><KeyRound size={20} /></div><div><strong>Bring any compatible model API</strong><p>OpenAI-compatible APIs work with the same KChat connection. Your key stays in this browser session.</p></div></div>
-          {modelConnections.length > 0 && <div className="model-connection-list">{modelConnections.map((connection) => <div className={`model-connection-row ${activeModelId === connection.id ? "active" : ""}`} key={connection.id}><button onClick={() => selectModelConnection(connection.id)}><span><strong>{connection.name}</strong><small>{connection.provider} Â· {connection.model}</small></span><span>{activeModelId === connection.id ? "Active" : "Use"}</span></button><button className="icon-btn mini-icon" title="Remove" onClick={() => removeModelConnection(connection.id)}><Trash2 size={13}/></button></div>)}</div>}
+          {modelConnections.length > 0 && <div className="model-connection-list">{modelConnections.map((connection) => <div className={`model-connection-row ${activeModelId === connection.id ? "active" : ""}`} key={connection.id}><button onClick={() => selectModelConnection(connection.id)}><span><strong>{connection.name}</strong><small>{connection.provider} · {connection.model}</small></span><span>{activeModelId === connection.id ? "Active" : "Use"}</span></button><button className="icon-btn mini-icon" title="Remove" onClick={() => removeModelConnection(connection.id)}><Trash2 size={13}/></button></div>)}</div>}
           <label className="field"><span>Provider</span><select value={modelForm.provider} onChange={(e) => startModelPreset(e.target.value)}><option>OpenAI</option><option>Gemini</option><option>OpenRouter</option><option>Groq</option><option>Mistral</option><option>Custom</option></select></label>
           <div className="form-grid"><label className="field"><span>Connection name</span><input value={modelForm.name} onChange={(e) => setModelForm({...modelForm,name:e.target.value})} placeholder="My Gemini" /></label><label className="field"><span>Model ID</span><input value={modelForm.model} onChange={(e) => setModelForm({...modelForm,model:e.target.value})} placeholder="gemini-3.8-flash" /></label></div>
           <label className="field"><span>API base URL</span><input value={modelForm.baseUrl} onChange={(e) => setModelForm({...modelForm,baseUrl:e.target.value})} placeholder="https://.../v1" /></label>
-          <div className="form-grid"><label className="field"><span>API key <em className="field-hint">paste first â provider is detected automatically</em></span><input autoFocus type="password" value={modelForm.apiKey} onChange={(e) => handleModelKeyChange(e.target.value)} placeholder="Paste your API key" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label><label className="field"><span>Auth header</span><input value={modelForm.authHeader} onChange={(e) => setModelForm({...modelForm,authHeader:e.target.value})} placeholder="Authorization" /></label></div>
+          <div className="form-grid"><label className="field"><span>API key <em className="field-hint">paste first — provider is detected automatically</em></span><input autoFocus type="password" value={modelForm.apiKey} onChange={(e) => handleModelKeyChange(e.target.value)} placeholder="Paste your API key" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label><label className="field"><span>Auth header</span><input value={modelForm.authHeader} onChange={(e) => setModelForm({...modelForm,authHeader:e.target.value})} placeholder="Authorization" /></label></div>
           <div className="form-grid"><label className="field"><span>Auth prefix</span><input value={modelForm.authPrefix} onChange={(e) => setModelForm({...modelForm,authPrefix:e.target.value})} placeholder="Bearer" /></label><label className="field"><span>API protocol</span><select value={modelForm.protocol} onChange={(e) => setModelForm({...modelForm,protocol:e.target.value as ModelConnection["protocol"]})}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label></div>
           <div className="security-note"><KeyRound size={14} /><span><strong>Quick connect:</strong> paste an OpenAI, Gemini, OpenRouter, or Groq key and KChat automatically fills the provider, endpoint, model, and protocol. You can still edit the advanced fields below. A native provider API that is not OpenAI-compatible needs a dedicated adapter.</span></div>{keyError && <div className="key-error" role="alert">{keyError}</div>}
-          <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey} disabled={keyTesting}>{keyTesting ? "Testing connectionâ¦" : "Test & connect"}</button></div>
+          <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey} disabled={keyTesting}>{keyTesting ? "Testing connection…" : "Test & connect"}</button></div>
         </Modal>
       )}
 
@@ -911,7 +928,7 @@ export default function Home() {
               <label className="field"><span>Description</span><input value={apiForm.description} onChange={(e) => setApiForm({...apiForm,description:e.target.value})} placeholder="Search my service" /></label>
               <label className="field"><span>Headers JSON</span><textarea rows={3} value={apiForm.headers} onChange={(e) => setApiForm({...apiForm,headers:e.target.value})} placeholder='{"Authorization":"Bearer ..."}' /></label>
               <label className="field"><span>Input schema JSON</span><textarea rows={6} value={apiForm.inputSchema} onChange={(e) => setApiForm({...apiForm,inputSchema:e.target.value})} /></label>
-              <p className="field-hint">The model sees the name, description and schemaânot your secret header values. API calls are executed by KChat's connector route.</p>
+              <p className="field-hint">The model sees the name, description and schema—not your secret header values. API calls are executed by KChat's connector route.</p>
               <div className="modal-actions"><button className="secondary" onClick={() => setConnectionFormOpen(false)}>Cancel</button><button className="primary" onClick={saveApiConnection}>Add API tool</button></div>
             </> : <>
               <label className="field"><span>Name</span><input value={mcpForm.name} onChange={(e) => setMcpForm({...mcpForm,name:e.target.value})} placeholder="My MCP" /></label>
@@ -934,20 +951,34 @@ export default function Home() {
       )}
       {settingsOpen && (
         <Modal title="KChat settings" icon={<Settings2 size={17} />} onClose={() => setSettingsOpen(false)}>
-          <div className="settings-tabs"><span className="selected">Model</span><span>Behavior</span><span>Privacy</span></div>
-          <label className="field"><span>Model ID</span><input value={settings.model} onChange={(e) => setSettings({ ...settings, model: e.target.value })} /><small>Use the exact model ID available to your API account.</small></label>
-          <label className="field"><span>System instructions</span><textarea rows={5} value={settings.system} onChange={(e) => setSettings({ ...settings, system: e.target.value })} /></label>
-          <label className="field range-field"><span>Temperature <b>{settings.temperature.toFixed(1)}</b></span><input type="range" min="0" max="1.5" step="0.1" value={settings.temperature} onChange={(e) => setSettings({ ...settings, temperature: Number(e.target.value) })} /></label>
-          <div className="modal-actions"><button className="secondary" onClick={() => setSettings({ ...DEFAULT_SETTINGS })}>Reset</button><button className="primary" onClick={() => setSettingsOpen(false)}>Save changes</button></div>
+          <div className="settings-tabs">
+            {([['model','Model'],['behavior','Behavior'],['privacy','Privacy']] as const).map(([id,label]) => <button key={id} className={settingsTab === id ? "selected" : ""} onClick={() => setSettingsTab(id)}>{label}</button>)}
+          </div>
+          {settingsTab === "model" && <>
+            <label className="field"><span>Model ID</span><input value={settings.model} onChange={(e) => setSettings({ ...settings, model: e.target.value })} /><small>Use the exact model ID available to your API account.</small></label>
+            <label className="field"><span>System instructions</span><textarea rows={5} value={settings.system} onChange={(e) => setSettings({ ...settings, system: e.target.value })} /></label>
+            <label className="field range-field"><span>Temperature <b>{settings.temperature.toFixed(1)}</b></span><input type="range" min="0" max="1.5" step="0.1" value={settings.temperature} onChange={(e) => setSettings({ ...settings, temperature: Number(e.target.value) })} /></label>
+          </>}
+          {settingsTab === "behavior" && <>
+            <label className="setting-toggle"><span><strong>Enter to send</strong><small>Press Enter to send; Shift+Enter creates a new line.</small></span><input type="checkbox" checked={settings.enterToSend} onChange={(e) => setSettings({ ...settings, enterToSend: e.target.checked })} /></label>
+            <label className="setting-toggle"><span><strong>Activity log</strong><small>Show request, tool and generation events above the composer.</small></span><input type="checkbox" checked={settings.showActivityLog} onChange={(e) => setSettings({ ...settings, showActivityLog: e.target.checked })} /></label>
+          </>}
+          {settingsTab === "privacy" && <>
+            <div className="privacy-note"><strong>Browser-local storage</strong><p>KChat can keep chats and settings on this device. Turn either option off to stop local persistence and remove the existing local copy.</p></div>
+            <label className="setting-toggle"><span><strong>Save conversations locally</strong><small>Keep your chat history in this browser's local storage.</small></span><input type="checkbox" checked={settings.persistChats} onChange={(e) => setSettings({ ...settings, persistChats: e.target.checked })} /></label>
+            <label className="setting-toggle"><span><strong>Save settings locally</strong><small>Remember preferences such as system instructions and temperature.</small></span><input type="checkbox" checked={settings.persistSettings} onChange={(e) => setSettings({ ...settings, persistSettings: e.target.checked })} /></label>
+            <p className="field-hint">API keys and connector credentials remain in session storage and are not exported with chats.</p>
+          </>}
+          <div className="modal-actions"><button className="secondary" onClick={() => { setSettings({ ...DEFAULT_SETTINGS }); setSettingsTab("model"); }}>Reset</button><button className="primary" onClick={() => setSettingsOpen(false)}>Done</button></div>
         </Modal>
       )}
     </main>
   );
 }
 
-function ChatTile({ chat, model, models, sending, draft, onModel, onDraft, onSend, onStop, onExpand, onClose }: { chat: Chat; model: ModelConnection | null; models: ModelConnection[]; sending: boolean; draft: string; onModel: (id: string) => void; onDraft: (value: string) => void; onSend: () => void; onStop: () => void; onExpand: () => void; onClose: () => void }) {
+function ChatTile({ chat, model, models, sending, draft, onModel, onDraft, onSend, onStop, onExpand, onExport, onClose }: { chat: Chat; model: ModelConnection | null; models: ModelConnection[]; sending: boolean; draft: string; onModel: (id: string) => void; onDraft: (value: string) => void; onSend: () => void; onStop: () => void; onExpand: () => void; onExport: () => void; onClose: () => void }) {
   return <article className="chat-tile">
-    <div className="chat-tile-head"><div className="chat-tile-title"><span className="tile-status" data-running={sending ? "true" : "false"}/><strong>{chat.title}</strong></div><div className="tile-actions"><button title="Expand" onClick={onExpand}><Maximize2 size={14}/></button><button title="Remove from grid" onClick={onClose}><X size={14}/></button></div></div>
+    <div className="chat-tile-head"><div className="chat-tile-title"><span className="tile-status" data-running={sending ? "true" : "false"}/><strong>{chat.title}</strong></div><div className="tile-actions"><button title="Export chat" onClick={onExport}><Download size={14}/></button><button title="Expand" onClick={onExpand}><Maximize2 size={14}/></button><button title="Remove from grid" onClick={onClose}><X size={14}/></button></div></div>
     <div className="tile-model-row"><span>Model</span><select value={model?.id || ""} onChange={(e) => onModel(e.target.value)} disabled={!models.length} aria-label={`Model for ${chat.title}`}>{models.length ? models.map((item) => <option key={item.id} value={item.id}>{item.provider} · {item.model}</option>) : <option value="">Connect a model</option>}</select></div>
     <div className="tile-messages">{chat.messages.length === 0 ? <div className="tile-empty"><Sparkles size={19}/><span>Ready for a separate conversation.</span></div> : chat.messages.map((message) => <div className={`tile-message ${message.role}`} key={message.id}><span className="tile-role">{message.role === "user" ? "You" : "KChat"}</span><p>{message.content || <span className="thinking"><i/><i/><i/></span>}</p></div>)}</div>
     <div className="tile-composer"><textarea value={draft} onChange={(e) => onDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); onSend(); } }} placeholder="Message…" rows={1}/>{sending ? <button className="send-btn stop" onClick={onStop}><Square size={12} fill="currentColor"/></button> : <button className="send-btn" onClick={onSend} disabled={!draft.trim()}><ArrowUp size={15}/></button>}</div>
