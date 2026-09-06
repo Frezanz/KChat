@@ -506,6 +506,127 @@ export default function Home() {
     return data;
   }
 
+  async function requestChatCompletion(chat: Chat, history: Message[], user: Message, controller: AbortController, model: ModelConnection) {
+    const endpoint = modelEndpoint(model);
+    const headers = modelHeaders(model);
+    const messages = [
+      { role: "system", content: settings.system },
+      ...contextMessages(chat, history).map((message) => ({ role: message.role, content: message.content })),
+      { role: user.role, content: user.content },
+    ];
+    const body = model.protocol === "responses"
+      ? { model: model.model, input: messages, temperature: settings.temperature, max_output_tokens: settings.maxOutputTokens, stream: false }
+      : { model: model.model, messages, temperature: settings.temperature, max_tokens: settings.maxOutputTokens, stream: false };
+    const response = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(body), signal: controller.signal });
+    if (!response.ok) throw new Error(await modelError(response));
+    const data = await response.json();
+    if (model.protocol === "responses") {
+      if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text;
+      const text = (data?.output || []).flatMap((item: any) => item?.content || [])
+        .map((part: any) => typeof part?.text === "string" ? part.text : "")
+        .filter(Boolean).join("\n");
+      if (text.trim()) return text;
+    } else {
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content === "string" && content.trim()) return content;
+      if (Array.isArray(content)) {
+        const text = content.map((part: any) => typeof part?.text === "string" ? part.text : "").filter(Boolean).join("\n");
+        if (text.trim()) return text;
+      }
+    }
+    throw new Error("Provider returned an empty or unsupported response.");
+  }
+
+  async function requestWithTools(chat: Chat, history: Message[], user: Message, controller: AbortController, model: ModelConnection) {
+    const attached = attachedConnections(chat);
+    const apiConnections = attached.filter((connection): connection is ApiConnection => connection.kind === "api");
+    const mcpConnections = attached.filter((connection): connection is McpConnection => connection.kind === "mcp");
+    const allTools = buildTools(chat);
+    if (!allTools.length) return requestChatCompletion(chat, history, user, controller, model);
+    if (model.protocol === "chat" && mcpConnections.length) {
+      throw new Error("Remote MCP connections require a Responses-compatible model.");
+    }
+
+    const messages = [
+      { role: "system", content: settings.system },
+      ...contextMessages(chat, history).map((message) => ({ role: message.role, content: message.content })),
+      { role: user.role, content: user.content },
+    ];
+    const maxRounds = 8;
+
+    if (model.protocol === "responses") {
+      let input: any[] = [...messages];
+      for (let round = 0; round < maxRounds; round++) {
+        const response = await fetch(modelEndpoint(model), {
+          method: "POST",
+          headers: modelHeaders(model),
+          signal: controller.signal,
+          body: JSON.stringify({ model: model.model, input, tools: allTools, temperature: settings.temperature, max_output_tokens: settings.maxOutputTokens, stream: false }),
+        });
+        if (!response.ok) throw new Error(await modelError(response));
+        const data = await response.json();
+        const output = Array.isArray(data?.output) ? data.output : [];
+        input.push(...output);
+        const calls = output.filter((item: any) => item?.type === "function_call");
+        if (!calls.length) {
+          if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text;
+          const text = output.flatMap((item: any) => item?.content || [])
+            .map((part: any) => typeof part?.text === "string" ? part.text : "")
+            .filter(Boolean).join("\n");
+          if (text.trim()) return text;
+          throw new Error("Provider returned an empty or unsupported response.");
+        }
+        for (const call of calls) {
+          const connection = apiConnections.find((item) => toolName(item) === call.name);
+          if (!connection) throw new Error(`Unknown function tool: ${String(call.name || "")}`);
+          let args: Record<string, unknown>;
+          try { args = parseJsonObject(String(call.arguments || "{}"), `Arguments for ${call.name}`); }
+          catch (error) { throw new Error(error instanceof Error ? error.message : "Invalid tool arguments."); }
+          const result = await executeApiConnection(connection, args, controller.signal);
+          input.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(result) });
+        }
+      }
+      throw new Error(`Tool execution exceeded the ${maxRounds}-round limit.`);
+    }
+
+    const tools = allTools.filter((tool: any) => tool.type === "function");
+    let currentMessages: any[] = [...messages];
+    for (let round = 0; round < maxRounds; round++) {
+      const response = await fetch(modelEndpoint(model), {
+        method: "POST",
+        headers: modelHeaders(model),
+        signal: controller.signal,
+        body: JSON.stringify({ model: model.model, messages: currentMessages, tools, tool_choice: "auto", temperature: settings.temperature, max_tokens: settings.maxOutputTokens, stream: false }),
+      });
+      if (!response.ok) throw new Error(await modelError(response));
+      const data = await response.json();
+      const message = data?.choices?.[0]?.message;
+      if (!message) throw new Error("Provider returned an empty or unsupported response.");
+      const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (!calls.length) {
+        const content = message.content;
+        if (typeof content === "string" && content.trim()) return content;
+        if (Array.isArray(content)) {
+          const text = content.map((part: any) => typeof part?.text === "string" ? part.text : "").filter(Boolean).join("\n");
+          if (text.trim()) return text;
+        }
+        throw new Error("Provider returned an empty response.");
+      }
+      currentMessages.push(message);
+      for (const call of calls) {
+        if (call?.type !== "function") continue;
+        const connection = apiConnections.find((item) => toolName(item) === call.function?.name);
+        if (!connection) throw new Error(`Unknown function tool: ${String(call.function?.name || "")}`);
+        let args: Record<string, unknown>;
+        try { args = parseJsonObject(String(call.function?.arguments || "{}"), `Arguments for ${call.function.name}`); }
+        catch (error) { throw new Error(error instanceof Error ? error.message : "Invalid tool arguments."); }
+        const result = await executeApiConnection(connection, args, controller.signal);
+        currentMessages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+      }
+    }
+    throw new Error(`Tool execution exceeded the ${maxRounds}-round limit.`);
+  }
+
   async function runConfiguredAgent(agent: AgentDefinition, prompt: string) {
     const model = modelConnections.find(m => m.id === agent.modelId) || activeModel;
     if (!model) throw new Error("Connect a model before running the agent.");
@@ -1114,7 +1235,7 @@ export default function Home() {
           onRefreshFile={() => void readRuntimeFile(codeFile)}
           onSaveFile={(content) => void saveRuntimeFile(codeFile, content)}
           onAddLog={(text) => setCodeLog((prev) => [...prev, text])}
-        /> : <AgentWorkspace agents={agents} onBuild={() => { setAgentDraft(DEFAULT_AGENT); setAgentBuilderOpen(true); }} onRun={async (agent) => { try { setAgentRunOutput(`Running ${agent.name}…`); setAgentRunOutput(await runConfiguredAgent(agent, `Start the task assigned to ${agent.name}. Ask for a concrete task if none is provided.`)); } catch (e) { setAgentRunOutput(e instanceof Error ? e.message : "Agent failed"); } }} onOpenCode={() => setWorkspaceMode("code")} onNewChat={newChat} />}
+        /> : <AgentWorkspace agents={agents} agentRunOutput={agentRunOutput} onBuild={() => { setAgentDraft(DEFAULT_AGENT); setAgentBuilderOpen(true); }} onRun={async (agent) => { try { setAgentRunOutput(`Running ${agent.name}…`); setAgentRunOutput(await runConfiguredAgent(agent, `Start the task assigned to ${agent.name}. Ask for a concrete task if none is provided.`)); } catch (e) { setAgentRunOutput(e instanceof Error ? e.message : "Agent failed"); } }} onOpenCode={() => setWorkspaceMode("code")} onNewChat={newChat} />}
       </section>
 
       {fullscreenId && (() => {
@@ -1283,7 +1404,7 @@ function CodeWorkspace({ project, file, pane, command, logs, runtimeStatus, prev
   </div>;
 }
 
-function AgentWorkspace({ agents, onBuild, onRun, onOpenCode, onNewChat }: { agents: AgentDefinition[]; onBuild: () => void; onRun: (agent: AgentDefinition) => void; onOpenCode: () => void; onNewChat: () => void }) {
+function AgentWorkspace({ agents, agentRunOutput, onBuild, onRun, onOpenCode, onNewChat }: { agents: AgentDefinition[]; agentRunOutput: string; onBuild: () => void; onRun: (agent: AgentDefinition) => void; onOpenCode: () => void; onNewChat: () => void }) {
   return <div className="agent-workspace"><div className="agent-workspace-head"><div><span className="eyebrow-inline"><i/> Agent studio</span><h1>Build AI teammates.</h1><p>Create reusable agents with their own instructions, models, tools and policies.</p></div><button className="primary" onClick={onBuild}><Plus size={14}/> Build agent</button></div><div className="agent-grid">{agents.length ? agents.map(agent => <div className="agent-card" key={agent.id}><div className="agent-avatar"><Bot size={18}/></div><div className="agent-card-copy"><strong>{agent.name}</strong><span>{agent.description}</span><small>{agent.tools.length} tools · {agent.memory} memory · {agent.approval} approval</small></div><div className="agent-card-actions"><span className={`agent-state ${agent.enabled ? "on" : "off"}`}>{agent.enabled ? "Ready" : "Disabled"}</span><button className="secondary" disabled={!agent.enabled} onClick={() => onRun(agent)}>Run</button></div></div>) : <div className="agent-empty"><Bot size={25}/><h3>No agents yet</h3><p>Build your first reusable AI teammate.</p><button className="secondary" onClick={onBuild}>Open Agent Builder</button></div>}</div>{agentRunOutput && <pre className="agent-run-output">{agentRunOutput}</pre>}<div className="agent-quick-actions"><button onClick={onOpenCode}><Code2 size={14}/> Open Code workspace</button><button onClick={onNewChat}><MessageCircle size={14}/> Start chat</button></div></div>;
 }
 
