@@ -1,1 +1,1 @@
-__PAGE_CONTENT__
+__PAGE__
