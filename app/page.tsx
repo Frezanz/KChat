@@ -885,6 +885,8 @@ export default function Home() {
       sandboxId || sessionStorage.getItem("kchat-e2b-sandbox-id") || "";
     const transcript: string[] = [];
     const maxSteps = 10;
+    let visualRepairCycles = 0;
+    const maxVisualRepairCycles = 3;
     const runId = crypto.randomUUID();
     const persistRun = (
       status: "running" | "waiting_approval" | "completed" | "failed",
@@ -1169,6 +1171,12 @@ export default function Home() {
           throw new Error(
             "Visual preview inspection requires Browser to be enabled for this agent.",
           );
+        if (visualRepairCycles >= maxVisualRepairCycles) {
+          throw new Error(
+            `Visual repair limit reached (${maxVisualRepairCycles} cycles). Review the captured evidence instead of looping.`,
+          );
+        }
+        visualRepairCycles += 1;
         const response = await fetch("/api/runtime", {
           method: "POST",
           signal: controller.signal,
@@ -1210,6 +1218,13 @@ export default function Home() {
           agent.tools.includes("Browser") &&
           data?.url
         ) {
+          if (visualRepairCycles >= maxVisualRepairCycles) {
+            transcript.push(
+              `automatic visual check skipped: visual repair limit reached (${maxVisualRepairCycles} cycles)`,
+            );
+            return data;
+          }
+          visualRepairCycles += 1;
           try {
             const inspectionResponse = await fetch("/api/runtime", {
               method: "POST",
