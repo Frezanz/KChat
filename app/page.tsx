@@ -38,11 +38,14 @@ type Message = { id: string; role: Role; content: string };
 type ContextMode = "isolated" | "connected" | "global";
 type Chat = { id: string; title: string; messages: Message[]; updatedAt: number; contextMode: ContextMode; connectedChats: string[]; connectionIds: string[] };
 type Settings = { model: string; system: string; temperature: number };
+type ModelConnection = { id: string; name: string; provider: string; baseUrl: string; protocol: "responses" | "chat"; model: string; apiKey: string; authHeader: string; authPrefix: string };
 type ApiConnection = { id: string; kind: "api"; name: string; description: string; url: string; method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; headers: Record<string, string>; inputSchema: Record<string, unknown> };
 type McpConnection = { id: string; kind: "mcp"; name: string; description: string; serverUrl: string; headers: Record<string, string>; requireApproval: "always" | "never" };
 type Connection = ApiConnection | McpConnection;
 
 const KEY = "kchat-api-key";
+const MODEL_CONNECTIONS = "kchat-model-connections-v1";
+const ACTIVE_MODEL = "kchat-active-model-v1";
 const CHATS = "kchat-chats-v3";
 const SETTINGS = "kchat-settings-v3";
 const CONNECTIONS = "kchat-connections-v1";
@@ -51,6 +54,28 @@ const DEFAULT_SETTINGS: Settings = {
   temperature: 0.7,
   system: "You are KChat, a capable, thoughtful AI assistant. Be clear, useful, and concise.",
 };
+
+
+const MODEL_PRESETS: Record<string, Partial<ModelConnection>> = {
+  OpenAI: { baseUrl: "https://api.openai.com/v1", protocol: "responses", model: "gpt-5.6-luna", authHeader: "Authorization", authPrefix: "Bearer" },
+  Gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", protocol: "chat", model: "gemini-3.8-flash", authHeader: "Authorization", authPrefix: "Bearer" },
+  OpenRouter: { baseUrl: "https://openrouter.ai/api/v1", protocol: "chat", model: "openai/gpt-5.4-pro", authHeader: "Authorization", authPrefix: "Bearer" },
+  Groq: { baseUrl: "https://api.groq.com/openai/v1", protocol: "responses", model: "openai/gpt-oss-120b", authHeader: "Authorization", authPrefix: "Bearer" },
+  Mistral: { baseUrl: "https://api.mistral.ai/v1", protocol: "chat", model: "mistral-large-latest", authHeader: "Authorization", authPrefix: "Bearer" },
+  Custom: { baseUrl: "", protocol: "chat", model: "", authHeader: "Authorization", authPrefix: "Bearer" },
+};
+
+function modelEndpoint(connection: ModelConnection) {
+  const base = connection.baseUrl.trim().replace(/\/$/, "");
+  if (/\/(chat\/completions|responses)$/i.test(base)) return base;
+  return `${base}/${connection.protocol === "responses" ? "responses" : "chat/completions"}`;
+}
+
+function modelHeaders(connection: ModelConnection) {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (connection.apiKey) headers[connection.authHeader || "Authorization"] = connection.authPrefix ? `${connection.authPrefix} ${connection.apiKey}` : connection.apiKey;
+  return headers;
+}
 
 const starters = [
   { icon: "✦", title: "Create something", text: "Help me turn an idea into a useful product. Start by asking the most important questions." },
@@ -87,6 +112,9 @@ export default function Home() {
   const [activeId, setActiveId] = useState("");
   const [settings, setSettings] = useState<Settings>(() => load(SETTINGS, DEFAULT_SETTINGS));
   const [apiKey, setApiKey] = useState("");
+  const [modelConnections, setModelConnections] = useState<ModelConnection[]>([]);
+  const [activeModelId, setActiveModelId] = useState("");
+  const [modelForm, setModelForm] = useState<ModelConnection>({ id: "", name: "", provider: "OpenAI", baseUrl: "https://api.openai.com/v1", protocol: "responses", model: "gpt-5.6-luna", apiKey: "", authHeader: "Authorization", authPrefix: "Bearer" });
   const [draft, setDraft] = useState("");
   const [query, setQuery] = useState("");
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -126,6 +154,18 @@ export default function Home() {
     try {
       const raw = sessionStorage.getItem(CONNECTIONS);
       if (raw) setConnections(JSON.parse(raw) as Connection[]);
+      const modelRaw = sessionStorage.getItem(MODEL_CONNECTIONS);
+      const legacyKey = sessionStorage.getItem(KEY) || "";
+      const savedModels = modelRaw ? JSON.parse(modelRaw) as ModelConnection[] : [];
+      if (savedModels.length) {
+        setModelConnections(savedModels);
+        const savedActive = sessionStorage.getItem(ACTIVE_MODEL) || savedModels[0].id;
+        const selected = savedModels.find((item) => item.id === savedActive) || savedModels[0];
+        setActiveModelId(selected.id); setApiKey(selected.apiKey); setSettings((prev) => ({ ...prev, model: selected.model }));
+      } else if (legacyKey) {
+        const legacy: ModelConnection = { id: uid(), name: "OpenAI", provider: "OpenAI", baseUrl: "https://api.openai.com/v1", protocol: "responses", model: settings.model, apiKey: legacyKey, authHeader: "Authorization", authPrefix: "Bearer" };
+        setModelConnections([legacy]); setActiveModelId(legacy.id);
+      }
     } catch {}
   }, []);
 
@@ -166,6 +206,7 @@ export default function Home() {
   }, [settings]);
 
   const active = chats.find((chat) => chat.id === activeId) || chats[0] || makeChat();
+  const activeModel = modelConnections.find((connection) => connection.id === activeModelId) || modelConnections[0] || null;
   const visibleChats = useMemo(
     () => chats.filter((chat) => chat.title.toLowerCase().includes(query.toLowerCase())),
     [chats, query],
@@ -255,47 +296,75 @@ export default function Home() {
     return data;
   }
 
+  async function requestChatCompletion(chat: Chat, history: Message[], user: Message, controller: AbortController) {
+    if (!activeModel) throw new Error("Connect a model API first.");
+    const response = await fetch(modelEndpoint(activeModel), {
+      method: "POST", signal: controller.signal, headers: modelHeaders(activeModel),
+      body: JSON.stringify({ model: activeModel.model, messages: [{ role: "system", content: settings.system }, ...contextMessages(chat, history), user], temperature: settings.temperature, stream: true }),
+    });
+    if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+    if (!response.body) throw new Error("The model returned no stream.");
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "", answer = "";
+    while (true) {
+      const { done, value: chunk } = await reader.read(); if (done) break;
+      buffer += decoder.decode(chunk, { stream: true }); const events = buffer.split("\n\n"); buffer = events.pop() || "";
+      for (const event of events) {
+        const line = event.split("\n").find((item) => item.startsWith("data:")); if (!line) continue;
+        const raw = line.slice(5).trim(); if (!raw || raw === "[DONE]") continue;
+        const data = JSON.parse(raw) as { choices?: Array<{ delta?: { content?: string }; message?: { content?: string } }>; error?: { message?: string } };
+        const delta = data.choices?.[0]?.delta?.content || data.choices?.[0]?.message?.content || "";
+        if (delta) answer += delta;
+        if (data.error) throw new Error(data.error.message || "Model error");
+      }
+      if (answer) updateChatById(chat.id, [...history, user, { id: "streaming", role: "assistant", content: answer }], history.length ? chat.title : user.content.slice(0, 44));
+    }
+    return answer || "The model returned an empty response.";
+  }
+
   async function requestWithTools(chat: Chat, history: Message[], user: Message, controller: AbortController) {
+    if (!activeModel) throw new Error("Connect a model API first.");
+    const attached = attachedConnections(chat);
+    const hasMcp = attached.some((item) => item.kind === "mcp");
+    if (hasMcp && activeModel.protocol !== "responses") throw new Error("This model connection uses Chat Completions. Use a Responses-compatible provider to attach remote MCP servers.");
+    if (!hasMcp && activeModel.protocol === "chat") {
+      const tools = attached.filter((item): item is ApiConnection => item.kind === "api").map((connection) => ({ type: "function", function: { name: toolName(connection), description: connection.description || `Call the ${connection.name} API.`, parameters: connection.inputSchema } }));
+      let messages: any[] = [{ role: "system", content: settings.system }, ...contextMessages(chat, history), user];
+      for (let round = 0; round < 8; round += 1) {
+        const response = await fetch(modelEndpoint(activeModel), { method: "POST", signal: controller.signal, headers: modelHeaders(activeModel), body: JSON.stringify({ model: activeModel.model, messages, temperature: settings.temperature, ...(tools.length ? { tools, tool_choice: "auto" } : {}) }) });
+        if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+        const data = await response.json(); const message = data.choices?.[0]?.message;
+        if (!message) throw new Error("The model returned an empty response.");
+        if (!message.tool_calls?.length) return message.content || "The model returned an empty response.";
+        messages.push(message);
+        for (const call of message.tool_calls) {
+          const connection = attached.find((item) => item.kind === "api" && toolName(item) === call.function?.name) as ApiConnection | undefined;
+          let result: unknown;
+          try { result = connection ? await executeApiConnection(connection, JSON.parse(call.function?.arguments || "{}"), controller.signal) : { error: "API connection is no longer attached." }; }
+          catch (error) { result = { error: (error as Error).message }; }
+          messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result).slice(0, 50000) });
+        }
+      }
+      throw new Error("Tool loop exceeded the 8-call safety limit.");
+    }
     const tools = buildTools(chat);
     const input: any[] = [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content }));
     let previousResponseId: string | undefined;
     for (let round = 0; round < 8; round += 1) {
-      const body: Record<string, unknown> = {
-        model: settings.model,
-        instructions: settings.system,
-        input,
-        temperature: settings.temperature,
-        stream: false,
-        parallel_tool_calls: false,
-        ...(tools.length ? { tools } : {}),
-      };
+      const body: Record<string, unknown> = { model: activeModel.model, instructions: settings.system, input, temperature: settings.temperature, stream: false, parallel_tool_calls: false, ...(tools.length ? { tools } : {}) };
       if (previousResponseId) body.previous_response_id = previousResponseId;
-      const response = await fetch("https://api.openai.com/v1/responses", {
-        method: "POST", signal: controller.signal,
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify(body),
-      });
+      const response = await fetch(modelEndpoint(activeModel), { method: "POST", signal: controller.signal, headers: modelHeaders(activeModel), body: JSON.stringify(body) });
       if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
       const data = await response.json();
       const approval = (data.output || []).find((item: any) => item.type === "mcp_approval_request");
       if (approval) throw new Error(`MCP ${approval.server_label || "server"} requested approval. Change its approval setting to Allow automatically or add an approval flow.`);
       const calls = (data.output || []).filter((item: any) => item.type === "function_call");
       if (!calls.length) return data.output_text || "The model returned an empty response.";
-      previousResponseId = data.id;
-      const outputs: any[] = [];
+      previousResponseId = data.id; const outputs: any[] = [];
       for (const call of calls) {
         const connection = attachedConnections(chat).find((item) => item.kind === "api" && toolName(item) === call.name) as ApiConnection | undefined;
-        if (!connection) {
-          outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "API connection is no longer attached." }) });
-          continue;
-        }
-        try {
-          const args = JSON.parse(call.arguments || "{}");
-          const result = await executeApiConnection(connection, args, controller.signal);
-          outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(result).slice(0, 50000) });
-        } catch (error) {
-          outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: (error as Error).message }) });
-        }
+        if (!connection) { outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: "API connection is no longer attached." }) }); continue; }
+        try { const result = await executeApiConnection(connection, JSON.parse(call.arguments || "{}"), controller.signal); outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify(result).slice(0, 50000) }); }
+        catch (error) { outputs.push({ type: "function_call_output", call_id: call.call_id, output: JSON.stringify({ error: (error as Error).message }) }); }
       }
       input.splice(0, input.length, ...outputs);
     }
@@ -304,7 +373,7 @@ export default function Home() {
 
   async function sendGrid(chatId: string) {
     const value = (gridDrafts[chatId] || "").trim();
-    if (!value || gridSending[chatId] || !apiKey) { if (!apiKey) setKeyOpen(true); return; }
+    if (!value || gridSending[chatId] || !activeModel) { if (!activeModel) setKeyOpen(true); return; }
     const chat = chats.find((item) => item.id === chatId); if (!chat) return;
     const history = chat.messages;
     const user: Message = { id: uid(), role: "user", content: value };
@@ -314,7 +383,7 @@ export default function Home() {
     updateChatById(chatId, [...history, user, assistant], title);
     const controller = new AbortController(); gridAbortRef.current[chatId] = controller;
     try {
-      const answer = await requestWithTools(chat, history, user, controller);
+      const answer = activeModel?.protocol === "chat" && !attachedConnections(chat).length ? await requestChatCompletion(chat, history, user, controller) : await requestWithTools(chat, history, user, controller);
       updateChatById(chatId, [...history, user, { ...assistant, content: answer }], title);
     } catch (e) {
       if ((e as Error).name !== "AbortError") { setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320)); updateChatById(chatId, [...history, user], title); }
@@ -368,7 +437,7 @@ export default function Home() {
     let value = text.trim();
     if (attachedText) value += `\n\n[Attached file: ${attachedName}]\n${attachedText}`;
     if (!value) return;
-    if (!apiKey) { setKeyOpen(true); return; }
+    if (!activeModel) { setKeyOpen(true); return; }
     const chat = chats.find((item) => item.id === activeId); if (!chat || sending[chat.id]) return;
     setDraft(""); setError(""); setSending((prev) => ({ ...prev, [chat.id]: true }));
     const user: Message = { id: uid(), role: "user", content: value };
@@ -377,25 +446,8 @@ export default function Home() {
     updateChatById(chat.id, [...history, user, assistant], title);
     const controller = new AbortController(); abortRef.current[chat.id] = controller;
     try {
-      if (!attachedConnections(chat).length) {
-        const response = await fetch("https://api.openai.com/v1/responses", {
-          method: "POST", signal: controller.signal,
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify({ model: settings.model, instructions: settings.system, input: [...contextMessages(chat, history), user].map((message) => ({ role: message.role, content: message.content })), temperature: settings.temperature, stream: true }),
-        });
-        if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
-        if (!response.body) throw new Error("The model returned no stream.");
-        const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "", answer = "";
-        while (true) {
-          const { done, value: chunk } = await reader.read(); if (done) break;
-          buffer += decoder.decode(chunk, { stream: true }); const events = buffer.split("\n\n"); buffer = events.pop() || "";
-          for (const event of events) { const line = event.split("\n").find((item) => item.startsWith("data:")); if (!line) continue; const raw = line.slice(5).trim(); if (!raw || raw === "[DONE]") continue; const data = JSON.parse(raw) as { type?: string; delta?: string; error?: { message?: string } }; if (data.type === "response.output_text.delta") { answer += data.delta || ""; updateChatById(chat.id, [...history, user, { ...assistant, content: answer }], title); } if (data.type === "error") throw new Error(data.error?.message || "Model error"); }
-        }
-        if (!answer) updateChatById(chat.id, [...history, user, { ...assistant, content: "The model returned an empty response." }], title);
-      } else {
-        const answer = await requestWithTools(chat, history, user, controller);
-        updateChatById(chat.id, [...history, user, { ...assistant, content: answer }], title);
-      }
+      const answer = attachedConnections(chat).length ? await requestWithTools(chat, history, user, controller) : await requestChatCompletion(chat, history, user, controller);
+      updateChatById(chat.id, [...history, user, { ...assistant, content: answer }], title);
     } catch (e) {
       if ((e as Error).name !== "AbortError") { setError((e as Error).message.replace(/\s+/g, " ").slice(0, 320)); updateChatById(chat.id, [...history, user], title); }
     } finally { abortRef.current[chat.id] = null; setSending((prev) => ({ ...prev, [chat.id]: false })); }
@@ -451,13 +503,42 @@ export default function Home() {
   }
 
   function saveKey() {
-    const value = apiKey.trim();
-    if (!value) { setKeyError("Paste your OpenAI API key first."); return; }
-    if (!/^sk-[A-Za-z0-9._-]+$/.test(value)) { setKeyError("That does not look like an OpenAI API key. Keys normally start with sk-."); return; }
+    const value = modelForm.apiKey.trim();
+    const url = modelForm.baseUrl.trim();
+    if (!value) { setKeyError("Paste your model API key first."); return; }
+    if (!url) { setKeyError("Enter the model API base URL."); return; }
+    if (!modelForm.model.trim()) { setKeyError("Enter the model ID."); return; }
+    const connection: ModelConnection = { ...modelForm, id: modelForm.id || uid(), name: modelForm.name.trim() || modelForm.provider, baseUrl: url.replace(/\/$/, ""), model: modelForm.model.trim() };
+    setModelConnections((prev) => [...prev.filter((item) => item.id !== connection.id), connection]);
+    setActiveModelId(connection.id);
+    setApiKey(connection.apiKey);
+    setSettings((prev) => ({ ...prev, model: connection.model }));
+    sessionStorage.setItem(MODEL_CONNECTIONS, JSON.stringify([...modelConnections.filter((item) => item.id !== connection.id), connection]));
+    sessionStorage.setItem(ACTIVE_MODEL, connection.id);
+    sessionStorage.setItem(KEY, connection.apiKey);
+    setKeyError(""); setKeyOpen(false);
+  }
+
+  function removeModelConnection(id: string) {
+    const next = modelConnections.filter((item) => item.id !== id);
+    setModelConnections(next);
+    sessionStorage.setItem(MODEL_CONNECTIONS, JSON.stringify(next));
+    if (activeModelId === id) {
+      const selected = next[0];
+      if (selected) { setActiveModelId(selected.id); setApiKey(selected.apiKey); setSettings((prev) => ({ ...prev, model: selected.model })); sessionStorage.setItem(ACTIVE_MODEL, selected.id); }
+      else { setActiveModelId(""); setApiKey(""); sessionStorage.removeItem(ACTIVE_MODEL); }
+    }
+  }
+
+  function selectModelConnection(id: string) {
+    const selected = modelConnections.find((item) => item.id === id); if (!selected) return;
+    setActiveModelId(selected.id); setApiKey(selected.apiKey); setSettings((prev) => ({ ...prev, model: selected.model })); sessionStorage.setItem(ACTIVE_MODEL, selected.id); sessionStorage.setItem(KEY, selected.apiKey);
+  }
+
+  function startModelPreset(provider: string) {
+    const preset = MODEL_PRESETS[provider] || MODEL_PRESETS.Custom;
+    setModelForm((prev) => ({ ...prev, provider, name: provider, ...preset } as ModelConnection));
     setKeyError("");
-    sessionStorage.setItem(KEY, value);
-    setApiKey(value);
-    setKeyOpen(false);
   }
 
   function clearActive() { setChats(prev => prev.map(c => c.id === active.id ? { ...c, messages: [], title: "New conversation", updatedAt: Date.now() } : c)); setDraft(""); setAttachedName(""); setAttachedText(""); }
@@ -580,7 +661,7 @@ export default function Home() {
           </div>
           <div className="top-right">
             <button className={`top-link grid-top-link ${gridOpen ? "selected" : ""}`} onClick={() => gridOpen ? setGridOpen(false) : openGrid()} aria-label={gridOpen ? "Return to single view" : "Open grid view"} title={gridOpen ? "Return to single view" : "Open grid view"}><LayoutGrid size={14} /><span className="grid-label">{gridOpen ? "Single view" : "Grid"}</span></button>
-            <button className="top-link" onClick={() => setKeyOpen(true)}><KeyRound size={14} />{apiKey ? "Connected" : "Connect"}</button>
+            <button className="top-link" onClick={() => setKeyOpen(true)}><KeyRound size={14} />{activeModel ? activeModel.provider : "Connect"}</button>
           </div>
         </header>
 
@@ -664,8 +745,8 @@ export default function Home() {
             {attachedConnections(active).length > 0 && <div className="connection-chips">{attachedConnections(active).map((connection) => <button key={connection.id} className="connection-chip" onClick={() => setIntegrationsOpen(true)} title="Manage chat connections"><Plug size={12}/><span>{connection.name}</span><X size={11}/></button>)}</div>}
             <textarea ref={textareaRef} value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }} placeholder="Message KChat…" rows={1} />
             <div className="composer-bottom">
-              <div className="composer-left"><input ref={fileRef} type="file" hidden onChange={e => { attach(e.target.files?.[0]); e.currentTarget.value=""; }}/><button title="Attach file" onClick={() => fileRef.current?.click()}><Paperclip size={17}/></button><div className="tools-wrap"><button title="Connect API or MCP" onClick={() => setIntegrationsOpen(true)}><Plug size={16}/></button><button title="Quick tools" onClick={() => { setToolsOpen(v=>!v); }}><Plus size={18}/></button>{toolsOpen && <div className="tools-menu"><button onClick={() => useQuickPrompt("Improve this prompt:")}><Sparkles size={13}/> Improve prompt</button><button onClick={() => useQuickPrompt("Explain this simply:")}><Sparkles size={13}/> Explain simply</button><button onClick={() => useQuickPrompt("Brainstorm 10 strong ideas for:")}><Sparkles size={13}/> Brainstorm</button></div>}</div><span className="composer-model">{settings.model}</span></div>
-              <div className="composer-right"><span className="connection-label"><i />{apiKey ? "Ready" : "API key required"}</span>{sending[active.id] ? <button className="send-btn stop" onClick={() => stop(active.id)}><Square size={13} fill="currentColor" /></button> : <button className="send-btn" onClick={() => send()} disabled={!draft.trim() && !attachedText}><ArrowUp size={17} /></button>}</div>
+              <div className="composer-left"><input ref={fileRef} type="file" hidden onChange={e => { attach(e.target.files?.[0]); e.currentTarget.value=""; }}/><button title="Attach file" onClick={() => fileRef.current?.click()}><Paperclip size={17}/></button><div className="tools-wrap"><button title="Connect API or MCP" onClick={() => setIntegrationsOpen(true)}><Plug size={16}/></button><button title="Quick tools" onClick={() => { setToolsOpen(v=>!v); }}><Plus size={18}/></button>{toolsOpen && <div className="tools-menu"><button onClick={() => useQuickPrompt("Improve this prompt:")}><Sparkles size={13}/> Improve prompt</button><button onClick={() => useQuickPrompt("Explain this simply:")}><Sparkles size={13}/> Explain simply</button><button onClick={() => useQuickPrompt("Brainstorm 10 strong ideas for:")}><Sparkles size={13}/> Brainstorm</button></div>}</div><span className="composer-model">{activeModel?.model || settings.model}</span></div>
+              <div className="composer-right"><span className="connection-label"><i />{activeModel ? `${activeModel.provider} • Ready` : "Connect a model"}</span>{sending[active.id] ? <button className="send-btn stop" onClick={() => stop(active.id)}><Square size={13} fill="currentColor" /></button> : <button className="send-btn" onClick={() => send()} disabled={!draft.trim() && !attachedText}><ArrowUp size={17} /></button>}</div>
             </div>
           </div>
           <p className="disclaimer">KChat may make mistakes. Requests are sent directly from your browser using your own API key.</p>
@@ -703,11 +784,16 @@ export default function Home() {
       })()}
 
       {keyOpen && (
-        <Modal title="Connect your model" icon={<KeyRound size={17} />} onClose={() => setKeyOpen(false)}>
-          <div className="modal-intro"><div className="intro-glow"><KeyRound size={20} /></div><div><strong>Bring your own key</strong><p>Your key stays in this browser session and is sent directly to the API. KChat never sends it to its own server.</p></div></div>
-          <label className="field"><span>OpenAI API key</span><input autoFocus type="password" value={apiKey} onChange={(e) => { setApiKey(e.target.value); setKeyError(""); }} placeholder="sk-…" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label>
-          <div className="security-note"><KeyRound size={14} /><span>Never paste a key into GitHub, screenshots, or source code.</span></div>{keyError && <div className="key-error" role="alert">{keyError}</div>}
-          <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey}>Connect key</button></div>
+        <Modal title="Connect a model API" icon={<KeyRound size={17} />} onClose={() => setKeyOpen(false)}>
+          <div className="modal-intro"><div className="intro-glow"><KeyRound size={20} /></div><div><strong>Bring any compatible model API</strong><p>OpenAI-compatible APIs work with the same KChat connection. Your key stays in this browser session.</p></div></div>
+          {modelConnections.length > 0 && <div className="model-connection-list">{modelConnections.map((connection) => <div className={`model-connection-row ${activeModelId === connection.id ? "active" : ""}`} key={connection.id}><button onClick={() => selectModelConnection(connection.id)}><span><strong>{connection.name}</strong><small>{connection.provider} · {connection.model}</small></span><span>{activeModelId === connection.id ? "Active" : "Use"}</span></button><button className="icon-btn mini-icon" title="Remove" onClick={() => removeModelConnection(connection.id)}><Trash2 size={13}/></button></div>)}</div>}
+          <label className="field"><span>Provider</span><select value={modelForm.provider} onChange={(e) => startModelPreset(e.target.value)}><option>OpenAI</option><option>Gemini</option><option>OpenRouter</option><option>Groq</option><option>Mistral</option><option>Custom</option></select></label>
+          <div className="form-grid"><label className="field"><span>Connection name</span><input value={modelForm.name} onChange={(e) => setModelForm({...modelForm,name:e.target.value})} placeholder="My Gemini" /></label><label className="field"><span>Model ID</span><input value={modelForm.model} onChange={(e) => setModelForm({...modelForm,model:e.target.value})} placeholder="gemini-3.8-flash" /></label></div>
+          <label className="field"><span>API base URL</span><input value={modelForm.baseUrl} onChange={(e) => setModelForm({...modelForm,baseUrl:e.target.value})} placeholder="https://.../v1" /></label>
+          <div className="form-grid"><label className="field"><span>API key</span><input autoFocus type="password" value={modelForm.apiKey} onChange={(e) => { setModelForm({...modelForm,apiKey:e.target.value}); setKeyError(""); }} placeholder="Paste any provider key" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label><label className="field"><span>Auth header</span><input value={modelForm.authHeader} onChange={(e) => setModelForm({...modelForm,authHeader:e.target.value})} placeholder="Authorization" /></label></div>
+          <div className="form-grid"><label className="field"><span>Auth prefix</span><input value={modelForm.authPrefix} onChange={(e) => setModelForm({...modelForm,authPrefix:e.target.value})} placeholder="Bearer" /></label><label className="field"><span>API protocol</span><select value={modelForm.protocol} onChange={(e) => setModelForm({...modelForm,protocol:e.target.value as ModelConnection["protocol"]})}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label></div>
+          <div className="security-note"><KeyRound size={14} /><span>Supports Gemini, OpenAI, OpenRouter, Groq, Mistral and custom OpenAI-compatible endpoints. A native provider API that is not OpenAI-compatible needs a dedicated adapter.</span></div>{keyError && <div className="key-error" role="alert">{keyError}</div>}
+          <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey}>Save & connect</button></div>
         </Modal>
       )}
 

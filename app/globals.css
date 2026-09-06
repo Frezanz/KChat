@@ -171,3 +171,18 @@
   .connection-row-actions { align-self:center; }
   .connection-toggle small { max-width:180px; }
 }
+
+
+/* Model provider connections */
+.model-connection-list { display:flex; flex-direction:column; gap:8px; margin:4px 0 14px; }
+.model-connection-row { display:flex; align-items:center; gap:8px; padding:8px; border:1px solid var(--border); border-radius:14px; background:var(--panel); }
+.model-connection-row.active { border-color:rgba(145,93,255,.55); box-shadow:0 0 0 1px rgba(145,93,255,.12) inset; }
+.model-connection-row > button:first-child { flex:1; min-width:0; border:0; background:transparent; color:inherit; display:flex; align-items:center; justify-content:space-between; gap:12px; text-align:left; cursor:pointer; padding:3px; }
+.model-connection-row strong, .model-connection-row small { display:block; }
+.model-connection-row small { color:var(--muted); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:320px; }
+.model-connection-row > button:first-child > span:last-child { font-size:11px; color:var(--muted); white-space:nowrap; }
+.mini-icon { flex:0 0 auto; }
+.connection-label { max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+@media (max-width: 640px) {
+  .model-connection-row small { max-width:190px; }
+}
