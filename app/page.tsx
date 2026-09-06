@@ -133,8 +133,13 @@ export default function Home() {
 
   useEffect(() => {
     localStorage.setItem(CHATS, JSON.stringify(chats));
-    if (activeId) endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chats, activeId]);
+  }, [chats]);
+
+  useEffect(() => {
+    if (activeId) {
+      requestAnimationFrame(() => endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" }));
+    }
+  }, [activeId]);
 
   useEffect(() => {
     localStorage.setItem(SETTINGS, JSON.stringify(settings));
