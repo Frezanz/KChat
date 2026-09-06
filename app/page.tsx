@@ -395,11 +395,13 @@ export default function Home() {
       if (!sandboxId || runtimeStatus !== "ready") await startRuntime();
       const id = sandboxId || sessionStorage.getItem("kchat-e2b-sandbox-id") || "";
       if (!id) throw new Error("E2B sandbox is not available");
-      const response = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "preview", sandboxId: id, port: 3000 }) });
+      const response = await fetch("/api/runtime", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "preview_start", sandboxId: id, directory: "/workspace/repo", port: 3000 }) });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Could not create preview URL");
-      setPreviewUrl(data.url); setCodeLog((prev) => [...prev, `Preview: ${data.url}`]);
-    } catch (e) { setCodeLog((prev) => [...prev, `Preview error: ${e instanceof Error ? e.message : "Unable to open preview"}`]); }
+      if (!response.ok) throw new Error(data.error || "Could not start KChat live preview");
+      setPreviewUrl(String(data.url || ""));
+      setCodeLog((prev) => [...prev, `KChat Live Preview: ${data.url || "running"}`, ...(data.command ? [`Preview command: ${data.command}`] : []), ...(data.ready === false ? ["Preview process is running but the port has not responded yet. Use refresh/status to check it."] : [])]);
+      setSandboxId(id); setRuntimeStatus("ready");
+    } catch (e) { setCodeLog((prev) => [...prev, `Preview error: ${e instanceof Error ? e.message : "Unable to start preview"}`]); }
   }
 
   async function stopRuntime() {
@@ -519,7 +521,7 @@ export default function Home() {
       void fetch("/api/agent-runs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: runId, agentId: agent.id, agentName: agent.name, prompt, status, sandboxId: sandbox || null, step: Number(patch.step || 0), transcript, metadata: patch }) }).catch(() => undefined);
     };
     persistRun("running", { step: 0 });
-    const hasConnector = agent.tools.some(tool => ["GitHub", "Netlify", "API tools", "Browser"].includes(tool));
+    const hasConnector = agent.tools.some(tool => ["Code runtime", "GitHub", "Netlify", "API tools", "Browser"].includes(tool));
 
     if (agent.tools.includes("Code runtime")) {
       if (!sandbox) {
@@ -539,7 +541,7 @@ export default function Home() {
       ...(agent.tools.includes("GitHub") ? ["github_list_repositories", "github_read_file", "github_write_file", "github_create_branch", "github_commit_multiple_files", "github_create_pull_request", "github_get_pull_request", "github_list_checks"] : []),
       ...(agent.tools.includes("Netlify") ? ["netlify_list_sites", "netlify_get_site", "netlify_list_deploys", "netlify_get_deploy", "netlify_trigger_build"] : []),
       ...(agent.tools.includes("API tools") ? customApis.map(connection => `custom_api:${connection.id}`) : []),
-      ...(agent.tools.includes("Code runtime") ? ["e2b_git_branch", "e2b_git_create_branch", "e2b_git_add", "e2b_git_commit", "e2b_git_push"] : []),
+      ...(agent.tools.includes("Code runtime") ? ["preview_start", "preview_status", "preview_logs", "preview_stop", "preview_restart", "e2b_git_branch", "e2b_git_create_branch", "e2b_git_add", "e2b_git_commit", "e2b_git_push"] : []),
       ...(agent.tools.includes("Browser") ? ["browser_open", "browser_goto", "browser_snapshot", "browser_screenshot", "browser_click", "browser_fill", "browser_type", "browser_scroll", "browser_console"] : []),
     ];
 
@@ -547,7 +549,7 @@ export default function Home() {
       const tool = String(action.tool || "");
       if (!tool) throw new Error("external_tool requires a tool name.");
       const args = action.args && typeof action.args === "object" ? action.args : {};
-      const destructive = tool.includes("write") || tool.includes("create_branch") || tool.includes("commit_multiple_files") || tool.includes("create_pull_request") || tool.includes("trigger_build") || tool.includes("browser_click") || tool.includes("browser_fill") || tool.includes("browser_type");
+      const destructive = tool.includes("write") || tool.includes("create_branch") || tool.includes("commit_multiple_files") || tool.includes("create_pull_request") || tool.includes("trigger_build") || tool === "preview_stop" || tool === "browser_click" || tool === "browser_fill" || tool === "browser_type";
       if (destructive && agent.approval !== "never") {
         persistRun("waiting_approval", { step, tool, args });
         const approved = await new Promise<boolean>((resolve) => {
@@ -620,6 +622,16 @@ export default function Home() {
         return { pr: latestPr, checks };
       }
 
+      if (tool.startsWith("preview_")) {
+        if (!agent.tools.includes("Code runtime")) throw new Error("Live preview requires Code runtime to be enabled for this agent.");
+        const response = await fetch("/api/runtime", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: tool, sandboxId: sandbox, ...args }) });
+        const data = await response.json().catch(() => ({ error: "Invalid preview response." }));
+        if (!response.ok) throw new Error(data?.error || `${tool} failed (${response.status})`);
+        if (data?.url) setPreviewUrl(String(data.url));
+        transcript.push(`${tool}:\n${JSON.stringify(data).slice(0, 16000)}`);
+        return data;
+      }
+
       if (tool.startsWith("browser_")) {
         if (!agent.tools.includes("Browser")) throw new Error("Browser tool is not enabled for this agent.");
         const response = await fetch("/api/runtime", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: tool, sandboxId: sandbox, ...args }) });
@@ -675,7 +687,7 @@ export default function Home() {
 
     let task = prompt.trim();
     for (let step = 1; step <= maxSteps; step++) {
-      const instruction = `${agent.instructions}\n\nYou are operating as an autonomous coding/product agent. Step ${step}/${maxSteps}.\nAvailable configured tools: ${agent.tools.join(", ") || "none"}.\n${agent.tools.includes("Code runtime") ? "E2B runtime is available. You may inspect, edit and run the workspace." : "No code runtime is available."}\n${agent.tools.includes("Code runtime") ? "Before e2b_git_push, KChat automatically runs a pre-push validation (build, otherwise test, otherwise lint, otherwise git diff --check). If validation fails, do not push; inspect the failure, fix the code, and retry validation." : ""}\n${hasConnector ? `External connector tools available: ${enabledConnectorTools.join(", ")}. For custom APIs use tool=custom_api:<connectionId>. Browser workflow: use browser_open/goto, browser_snapshot and browser_screenshot, interact with refs/selectors, then re-snapshot and screenshot to verify. GitHub workflow: import the repository into E2B, create a feature branch, inspect/edit/test, then stage/commit/push only after approval. After a successful e2b_git_push, KChat automatically creates the pull request, polls its CI checks, and can locate a Netlify Deploy Preview when siteId is supplied. Do not create a duplicate pull request and never merge automatically.` : "No external connectors are enabled."}\n${agent.tools.includes("Remote MCP") ? "Remote MCP is configured for normal KChat Responses requests, but this bounded JSON agent loop cannot directly approve MCP calls." : ""}\nReturn ONLY one JSON object with this shape: {"action":"read_file|write_file|run_command|list_files|search_files|git_status|git_diff|external_tool|done","path":"...","content":"...","command":"...","query":"...","tool":"...","args":{},"message":"..."}. For native E2B git operations use external_tool with tool=e2b_git_branch, e2b_git_create_branch, e2b_git_add, e2b_git_commit, or e2b_git_push and pass arguments in args. For a GitHub repository task, prefer importing the repo into E2B first, create a feature branch in E2B, make and test changes there, inspect git diff, then stage/commit/push only after approval.\nUse read_file before editing when useful. Use write_file for complete file content. Use run_command for tests/builds. Use external_tool for GitHub, Netlify or configured API actions. When the task is complete, return action=done.\n\nTask: ${task}\n\nPrevious tool results:\n${transcript.slice(-8).join("\n")}`;
+      const instruction = `${agent.instructions}\n\nYou are operating as an autonomous coding/product agent. Step ${step}/${maxSteps}.\nAvailable configured tools: ${agent.tools.join(", ") || "none"}.\n${agent.tools.includes("Code runtime") ? "E2B runtime is available. You may inspect, edit and run the workspace. KChat also provides a native Live Preview manager: use preview_start to launch the app, preview_status/preview_logs to diagnose it, and preview_restart after code changes when needed. The returned preview URL can be inspected with Browser." : "No code runtime is available."}\n${agent.tools.includes("Code runtime") ? "Before e2b_git_push, KChat automatically runs a pre-push validation (build, otherwise test, otherwise lint, otherwise git diff --check). If validation fails, do not push; inspect the failure, fix the code, and retry validation." : ""}\n${hasConnector ? `External connector tools available: ${enabledConnectorTools.join(", ")}. For custom APIs use tool=custom_api:<connectionId>. Browser workflow: use browser_open/goto, browser_snapshot and browser_screenshot, interact with refs/selectors, then re-snapshot and screenshot to verify. GitHub workflow: import the repository into E2B, create a feature branch, inspect/edit/test, then stage/commit/push only after approval. After a successful e2b_git_push, KChat automatically creates the pull request, polls its CI checks, and can locate a Netlify Deploy Preview when siteId is supplied. Do not create a duplicate pull request and never merge automatically.` : "No external connectors are enabled."}\n${agent.tools.includes("Remote MCP") ? "Remote MCP is configured for normal KChat Responses requests, but this bounded JSON agent loop cannot directly approve MCP calls." : ""}\nReturn ONLY one JSON object with this shape: {"action":"read_file|write_file|run_command|list_files|search_files|git_status|git_diff|external_tool|done","path":"...","content":"...","command":"...","query":"...","tool":"...","args":{},"message":"..."}. For native E2B git operations use external_tool with tool=e2b_git_branch, e2b_git_create_branch, e2b_git_add, e2b_git_commit, or e2b_git_push and pass arguments in args. For a GitHub repository task, prefer importing the repo into E2B first, create a feature branch in E2B, make and test changes there, inspect git diff, then stage/commit/push only after approval.\nUse read_file before editing when useful. Use write_file for complete file content. Use run_command for tests/builds. Use external_tool for GitHub, Netlify or configured API actions. When the task is complete, return action=done.\n\nTask: ${task}\n\nPrevious tool results:\n${transcript.slice(-8).join("\n")}`;
       const reply = await requestChatCompletion(fakeChat, [], { id: `agent-${step}`, role: "user", content: instruction }, controller, model);
       const match = reply.match(/\{[\s\S]*\}/);
       if (!match) { transcript.push(`agent: ${reply.slice(0, 1000)}`); break; }
@@ -1388,7 +1400,7 @@ function CodeWorkspace({ project, file, pane, command, logs, runtimeStatus, prev
           <div className="code-editor"><div className="editor-tab"><FileText size={13}/>{file}<span>·</span><button onClick={onRefreshFile}>refresh</button><button onClick={() => onSaveFile(editorValue)}>save</button></div><textarea className="code-editor-input" value={editorValue} onChange={(e) => setEditorValue(e.target.value)} onKeyDown={(e) => { if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); onSaveFile(editorValue); } }} spellCheck={false} aria-label={`Edit ${file}`} /></div>
         </div>}
         {pane === "terminal" && <div className="terminal-view"><div className="terminal-output">{logs.map((line, i) => <div key={i} className={line.startsWith("$") ? "command-line" : ""}>{line}</div>)}</div><div className="terminal-input"><span>$</span><input value={command} onChange={e => onCommand(e.target.value)} onKeyDown={e => { if (e.key === "Enter") onRun(); }} placeholder="npm run dev"/><button onClick={onRun}><ArrowUp size={14}/></button></div></div>}
-        {pane === "browser" && <div className="browser-view"><div className="browser-bar"><span>{previewUrl || "localhost:3000"}</span><button onClick={onPreview}><Play size={12}/></button></div>{previewUrl ? <iframe className="live-preview" src={previewUrl} title={`${project} live preview`} /> : <div className="browser-preview"><div className="preview-orb"><Sparkles size={22}/></div><strong>{project}</strong><span>Live E2B preview</span><small>Run your development server on port 3000, then refresh this pane.</small></div>}</div>}
+        {pane === "browser" && <div className="browser-view"><div className="browser-bar"><span>{previewUrl || "localhost:3000"}</span><button onClick={onPreview}><Play size={12}/></button></div>{previewUrl ? <iframe className="live-preview" src={previewUrl} title={`${project} live preview`} /> : <div className="browser-preview"><div className="preview-orb"><Sparkles size={22}/></div><strong>{project}</strong><span>KChat Live Preview</span><small>Run or restart the managed development server on port 3000. Netlify is not required for this preview.</small></div>}</div>}
         {pane === "agent" && <div className="agent-view"><div className="agent-card"><div className="agent-avatar"><Bot size={18}/></div><div><strong>Build Agent</strong><span>Scoped to {project}</span></div><button onClick={() => onAddLog("Agent thread started for this workspace.")}>Start</button></div><div className="agent-empty"><Sparkles size={24}/><h3>What should we build?</h3><p>Give the coding agent a bounded objective. It can inspect files, propose changes and run verification once a local execution backend is connected.</p></div></div>}
         <div className="code-commandbar"><Command size={14}/><input placeholder="Ask the workspace agent to inspect, change, run or explain…" onKeyDown={e => { if (e.key === "Enter" && e.currentTarget.value.trim()) { onAddLog(`Agent request: ${e.currentTarget.value.trim()}`); e.currentTarget.value = ""; } }}/><span>⌘↵</span></div>
       </div>

@@ -35,6 +35,75 @@ function browserUrl(value: unknown) {
   return url;
 }
 
+const PREVIEW_STATE = "/tmp/kchat-preview.json";
+const PREVIEW_LOG = "/tmp/kchat-preview.log";
+const PREVIEW_PID = "/tmp/kchat-preview.pid";
+
+function previewPort(value: unknown) {
+  const port = Number(value || 3000);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid preview port.");
+  return port;
+}
+
+function previewDirectory(value: unknown) {
+  return gitWorkspacePath(value || "/workspace/repo");
+}
+
+async function readPreviewState(sandbox: Sandbox) {
+  try {
+    return JSON.parse(await sandbox.files.read(PREVIEW_STATE)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function previewProcessAlive(sandbox: Sandbox) {
+  const result = await sandbox.commands.run(`if [ -f ${shellQuote(PREVIEW_PID)} ]; then kill -0 $(cat ${shellQuote(PREVIEW_PID)}) 2>/dev/null; else exit 1; fi`, { timeoutMs: 10000 });
+  return (result.exitCode ?? 1) === 0;
+}
+
+async function previewStart(sandbox: Sandbox, body: Record<string, unknown>) {
+  const port = previewPort(body.port);
+  const cwd = previewDirectory(body.directory);
+  const existing = await readPreviewState(sandbox);
+  if (existing && await previewProcessAlive(sandbox)) {
+    const existingPort = Number(existing.port || port);
+    return { ...existing, running: true, url: sandbox.getHost(existingPort) };
+  }
+
+  const explicit = String(body.command || "").trim();
+  let command = explicit;
+  if (!command) {
+    const detect = await sandbox.commands.run(`cd ${shellQuote(cwd)} && node -e ${shellQuote("const p=require('./package.json'); console.log(JSON.stringify({scripts:p.scripts||{}, deps:{...p.dependencies,...p.devDependencies}}))")}`, { timeoutMs: 20000 });
+    if ((detect.exitCode ?? 1) !== 0) throw new Error("No package.json found. Pass a preview command explicitly.");
+    let manifest: { scripts?: Record<string, string>; deps?: Record<string, string> } = {};
+    try { manifest = JSON.parse(String(detect.stdout || "").trim()); } catch { throw new Error("Could not inspect package.json for a preview command."); }
+    const scripts = manifest.scripts || {};
+    const deps = manifest.deps || {};
+    const manager = await sandbox.commands.run(`cd ${shellQuote(cwd)} && if [ -f pnpm-lock.yaml ]; then printf pnpm; elif [ -f yarn.lock ]; then printf yarn; elif [ -f bun.lockb ] || [ -f bun.lock ]; then printf bun; else printf npm; fi`, { timeoutMs: 10000 });
+    const pm = String(manager.stdout || "npm").trim();
+    const run = (script: string) => pm === "npm" ? `npm run ${script}` : `${pm} ${script}`;
+    if (scripts.dev) command = run("dev");
+    else if (scripts.start) command = run("start");
+    else if (scripts.preview) command = run("preview");
+    else throw new Error("No dev/start/preview script found. Pass a preview command explicitly.");
+    if (deps.next) command += ` -- -p ${port}`;
+    else if (deps.vite || deps["@vitejs/plugin-react"] || deps["@vitejs/plugin-react-swc"]) command += ` -- --host 0.0.0.0 --port ${port}`;
+    else command = `PORT=${port} HOST=0.0.0.0 HOSTNAME=0.0.0.0 ${command}`;
+  } else {
+    command = `PORT=${port} HOST=0.0.0.0 HOSTNAME=0.0.0.0 ${command}`;
+  }
+
+  await sandbox.commands.run(`rm -f ${shellQuote(PREVIEW_PID)}; : > ${shellQuote(PREVIEW_LOG)}; cd ${shellQuote(cwd)}; nohup sh -lc ${shellQuote(command)} >> ${shellQuote(PREVIEW_LOG)} 2>&1 </dev/null & echo $! > ${shellQuote(PREVIEW_PID)}`, { timeoutMs: 20000 });
+  const startedAt = new Date().toISOString();
+  await sandbox.files.write(PREVIEW_STATE, JSON.stringify({ port, cwd, command, startedAt }, null, 2));
+  const probe = await sandbox.commands.run(`for i in $(seq 1 40); do if (curl -fsS --max-time 2 http://127.0.0.1:${port}/ >/dev/null 2>&1) || (python3 -c ${shellQuote(`import urllib.request; urllib.request.urlopen('http://127.0.0.1:${port}/', timeout=2)`) } >/dev/null 2>&1); then exit 0; fi; sleep 0.5; done; exit 1`, { timeoutMs: 30000 });
+  const running = await previewProcessAlive(sandbox);
+  const logs = await sandbox.commands.run(`tail -n 80 ${shellQuote(PREVIEW_LOG)} 2>/dev/null || true`, { timeoutMs: 10000 });
+  if (!running) throw new Error(`Preview process exited.\n${String(logs.stdout || logs.stderr || "").slice(-12000)}`);
+  return { port, cwd, command, startedAt, running: true, ready: (probe.exitCode ?? 1) === 0, url: sandbox.getHost(port), logs: String(logs.stdout || "").slice(-12000) };
+}
+
 async function connectSandbox(id: string) {
   if (!process.env.E2B_API_KEY) throw new Error("E2B is not configured. Add E2B_API_KEY to the KChat deployment environment.");
   return Sandbox.connect(id);
@@ -91,6 +160,28 @@ export async function POST(request: NextRequest) {
       await sandbox.commands.run(`rm -rf '${escaped}'; mkdir -p /workspace; git clone --origin origin --no-tags ${ref ? `--branch '${ref.replace(/'/g, "'\"'\"'")}' ` : ""}${cloneUrl} '${escaped}'`, { envs, timeoutMs: 300000 });
       if (token) await sandbox.commands.run("rm -f /tmp/kchat-askpass.sh");
       return NextResponse.json({ ok: true, sandboxId, directory, repoUrl: cloneUrl, ref: ref || null });
+    }
+
+    if (["preview_start", "preview_status", "preview_logs", "preview_stop", "preview_restart"].includes(action)) {
+      if (action === "preview_start" || action === "preview_restart") {
+        if (action === "preview_restart") {
+          await sandbox.commands.run(`if [ -f ${shellQuote(PREVIEW_PID)} ]; then kill $(cat ${shellQuote(PREVIEW_PID)}) 2>/dev/null || true; fi; rm -f ${shellQuote(PREVIEW_PID)}`, { timeoutMs: 10000 });
+        }
+        return NextResponse.json(await previewStart(sandbox, body));
+      }
+      if (action === "preview_status") {
+        const state = await readPreviewState(sandbox);
+        if (!state) return NextResponse.json({ running: false });
+        const running = await previewProcessAlive(sandbox);
+        return NextResponse.json({ ...state, running, url: sandbox.getHost(Number(state.port || 3000)) });
+      }
+      if (action === "preview_logs") {
+        const lines = Math.max(1, Math.min(Number(body.lines) || 120, 1000));
+        const result = await sandbox.commands.run(`tail -n ${lines} ${shellQuote(PREVIEW_LOG)} 2>/dev/null || true`, { timeoutMs: 10000 });
+        return NextResponse.json({ logs: result.stdout || "", stderr: result.stderr || "" });
+      }
+      await sandbox.commands.run(`if [ -f ${shellQuote(PREVIEW_PID)} ]; then kill $(cat ${shellQuote(PREVIEW_PID)}) 2>/dev/null || true; fi; rm -f ${shellQuote(PREVIEW_PID)}`, { timeoutMs: 10000 });
+      return NextResponse.json({ ok: true, stopped: true });
     }
 
     if (["browser_open", "browser_goto", "browser_snapshot", "browser_screenshot", "browser_click", "browser_fill", "browser_type", "browser_scroll", "browser_console"].includes(action)) {
@@ -179,7 +270,7 @@ export async function POST(request: NextRequest) {
       }
       const askpass = "/tmp/kchat-askpass.sh";
       const envs = { GITHUB_TOKEN: token, GIT_ASKPASS: askpass, GIT_TERMINAL_PROMPT: "0" };
-      await sandbox.files.write(askpass, '#!/bin/sh\nprintf '%s\n' "$GITHUB_TOKEN"\n');
+      await sandbox.files.write(askpass, "#!/bin/sh\nprintf '%s\\n' \"$GITHUB_TOKEN\"\n");
       await sandbox.commands.run(`chmod 700 ${shellQuote(askpass)}`);
       try {
         const result = await sandbox.commands.run(`cd ${shellQuote(cwd)} && git push --set-upstream origin ${shellQuote(branch)}`, { envs, timeoutMs: 180000 });
