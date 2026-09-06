@@ -427,7 +427,7 @@ export default function Home() {
             </button>
           </div>
           <div className="top-right">
-            <button className={`top-link ${gridOpen ? "selected" : ""}`} onClick={() => gridOpen ? setGridOpen(false) : openGrid()}><LayoutGrid size={14} />{gridOpen ? "Single view" : "Grid"}</button>
+            <button className={`top-link grid-top-link ${gridOpen ? "selected" : ""}`} onClick={() => gridOpen ? setGridOpen(false) : openGrid()} aria-label={gridOpen ? "Return to single view" : "Open grid view"} title={gridOpen ? "Return to single view" : "Open grid view"}><LayoutGrid size={14} /><span className="grid-label">{gridOpen ? "Single view" : "Grid"}</span></button>
             <button className="top-link" onClick={() => setKeyOpen(true)}><KeyRound size={14} />{apiKey ? "Connected" : "Connect"}</button>
             <button className="icon-btn" onClick={() => setMoreOpen(v => !v)}><MoreHorizontal size={18}/></button>
             <div className="mini-avatar">F</div>
