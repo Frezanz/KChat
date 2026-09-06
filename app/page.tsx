@@ -31,9 +31,20 @@ import {
   Plug,
   Github,
   Globe2,
+  Code2,
+  Terminal,
+  FolderTree,
+  MonitorPlay,
+  Bot,
+  Play,
+  GitBranch,
+  Command,
+  PanelTop,
+  SplitSquareHorizontal,
 } from "lucide-react";
 
 type Role = "user" | "assistant";
+type WorkspaceMode = "chat" | "code" | "agent";
 type Message = { id: string; role: Role; content: string };
 type ContextMode = "isolated" | "connected" | "global";
 type Chat = { id: string; title: string; messages: Message[]; updatedAt: number; contextMode: ContextMode; connectedChats: string[]; connectionIds: string[]; modelId?: string };
@@ -178,6 +189,12 @@ export default function Home() {
   const [attachedName, setAttachedName] = useState("");
   const [attachedText, setAttachedText] = useState("");
   const [gridOpen, setGridOpen] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("chat");
+  const [codePane, setCodePane] = useState<"files" | "terminal" | "browser" | "agent">("files");
+  const [codeCommand, setCodeCommand] = useState("");
+  const [codeProject, setCodeProject] = useState("KChat");
+  const [codeFile, setCodeFile] = useState("app/page.tsx");
+  const [codeLog, setCodeLog] = useState<string[]>(["Workspace ready.", "Project folder: KChat", "No local terminal attached — connect a workspace agent to execute commands."]);
   const [gridIds, setGridIds] = useState<string[]>([]);
   const [fullscreenId, setFullscreenId] = useState<string | null>(null);
   const [gridDrafts, setGridDrafts] = useState<Record<string, string>>({});
@@ -784,11 +801,16 @@ export default function Home() {
           <div className="top-left">
             <button className="icon-btn mobile-only" onClick={() => setMobileOpen(true)}><Menu size={19} /></button>
             <button className="icon-btn desktop-only" onClick={() => setCollapsed((value) => !value)}><PanelLeft size={18} /></button>
-            <button className="model-select" onClick={() => setSettingsOpen(true)}>
+            <div className="mode-switcher" role="tablist" aria-label="KChat workspace mode">
+              <button className={workspaceMode === "chat" ? "selected" : ""} onClick={() => setWorkspaceMode("chat")}><MessageCircle size={13}/> Chat</button>
+              <button className={workspaceMode === "code" ? "selected" : ""} onClick={() => setWorkspaceMode("code")}><Code2 size={13}/> Code</button>
+              <button className={workspaceMode === "agent" ? "selected" : ""} onClick={() => setWorkspaceMode("agent")}><Bot size={13}/> Agent</button>
+            </div>
+            {workspaceMode === "chat" && <button className="model-select" onClick={() => setSettingsOpen(true)}>
               <span className="status-dot" />
               <span>{settings.model}</span>
               <ChevronDown size={13} />
-            </button>
+            </button>}
           </div>
           <div className="top-right">
             <button className={`top-link grid-top-link ${gridOpen ? "selected" : ""}`} onClick={() => gridOpen ? setGridOpen(false) : openGrid()} aria-label={gridOpen ? "Return to single view" : "Open grid view"} title={gridOpen ? "Return to single view" : "Open grid view"}><LayoutGrid size={14} /><span className="grid-label">{gridOpen ? "Single view" : "Grid"}</span></button>
@@ -796,6 +818,7 @@ export default function Home() {
           </div>
         </header>
 
+        {workspaceMode === "chat" ? <>
         <div className={`conversation ${gridOpen ? "grid-conversation" : ""}`}>
           {gridOpen ? (
             <div className="grid-workspace">
@@ -887,6 +910,20 @@ export default function Home() {
           </div>
           <p className="disclaimer">KChat may make mistakes. Requests are sent directly from your browser using your own API key.</p>
         </div>
+        </>
+        ) : workspaceMode === "code" ? <CodeWorkspace
+          project={codeProject}
+          file={codeFile}
+          pane={codePane}
+          command={codeCommand}
+          logs={codeLog}
+          onProject={setCodeProject}
+          onFile={setCodeFile}
+          onPane={setCodePane}
+          onCommand={setCodeCommand}
+          onRun={() => { const command = codeCommand.trim() || "npm run dev"; setCodeLog((prev) => [...prev, `$ ${command}`, "Command queued. Connect a local coding agent/terminal to execute it."]); setCodeCommand(""); }}
+          onAddLog={(text) => setCodeLog((prev) => [...prev, text])}
+        /> : <AgentWorkspace onOpenCode={() => setWorkspaceMode("code")} onNewChat={newChat} />
       </section>
 
       {fullscreenId && (() => {
@@ -994,6 +1031,46 @@ export default function Home() {
       )}
     </main>
   );
+}
+
+function CodeWorkspace({ project, file, pane, command, logs, onProject, onFile, onPane, onCommand, onRun, onAddLog }: { project: string; file: string; pane: "files" | "terminal" | "browser" | "agent"; command: string; logs: string[]; onProject: (value: string) => void; onFile: (value: string) => void; onPane: (value: "files" | "terminal" | "browser" | "agent") => void; onCommand: (value: string) => void; onRun: () => void; onAddLog: (text: string) => void }) {
+  const files = ["app/page.tsx", "app/globals.css", "app/layout.tsx", "lib/tool-registry.ts", "package.json", "README.md"];
+  const snippets: Record<string, string> = {
+    "app/page.tsx": "export default function Home() {\n  return <main>KChat</main>;\n}",
+    "app/globals.css": ".app { min-height: 100dvh; }\n.workspace { display: flex; }",
+    "app/layout.tsx": "export default function RootLayout({ children }) {\n  return <html><body>{children}</body></html>;\n}",
+    "lib/tool-registry.ts": "export const tools = [\n  // Connected tools\n];",
+    "package.json": "{\n  \"scripts\": { \"dev\": \"next dev\", \"build\": \"next build\" }\n}",
+    "README.md": "# KChat\n\nPrivate AI workspace."
+  };
+  const paneTitle = pane === "files" ? "Files" : pane === "terminal" ? "Terminal" : pane === "browser" ? "Browser" : "Agent thread";
+  return <div className="code-workspace">
+    <div className="code-toolbar">
+      <div className="code-project"><div className="project-icon"><Code2 size={15}/></div><div><strong>{project}</strong><small>Project workspace</small></div></div>
+      <div className="code-toolbar-actions"><button onClick={() => onAddLog("Workspace check requested.")}><Play size={13}/> Run</button><button><GitBranch size={13}/> main</button><button><SplitSquareHorizontal size={13}/> Split</button></div>
+    </div>
+    <div className="code-layout">
+      <aside className="code-rail">
+        {[ ["files",FolderTree,"Files"], ["terminal",Terminal,"Terminal"], ["browser",MonitorPlay,"Browser"], ["agent",Bot,"Agent"] ].map(([id, Icon, label]) => <button key={id as string} className={pane === id ? "selected" : ""} onClick={() => onPane(id as any)} title={label as string}><Icon size={16}/><span>{label as string}</span></button>)}
+      </aside>
+      <div className="code-main">
+        <div className="code-main-head"><span><i/> {paneTitle}</span><div><button title="Command bar"><Command size={14}/></button><button title="More"><MoreHorizontal size={14}/></button></div></div>
+        {pane === "files" && <div className="code-files-view">
+          <div className="file-tree"><div className="tree-project"><ChevronDown size={13}/><strong>{project}</strong></div>{files.map(path => <button key={path} className={file === path ? "selected" : ""} onClick={() => onFile(path)}><FileText size={13}/><span>{path}</span></button>)}</div>
+          <div className="code-editor"><div className="editor-tab"><FileText size={13}/>{file}<span>·</span><span>saved</span></div><pre>{snippets[file] || "// Select a file to inspect it."}</pre></div>
+        </div>}
+        {pane === "terminal" && <div className="terminal-view"><div className="terminal-output">{logs.map((line, i) => <div key={i} className={line.startsWith("$") ? "command-line" : ""}>{line}</div>)}</div><div className="terminal-input"><span>$</span><input value={command} onChange={e => onCommand(e.target.value)} onKeyDown={e => { if (e.key === "Enter") onRun(); }} placeholder="npm run dev"/><button onClick={onRun}><ArrowUp size={14}/></button></div></div>}
+        {pane === "browser" && <div className="browser-view"><div className="browser-bar"><span>localhost:3000</span><button onClick={() => onAddLog("Browser preview refreshed.")}><Play size={12}/></button></div><div className="browser-preview"><div className="preview-orb"><Sparkles size={22}/></div><strong>{project}</strong><span>Preview surface</span><small>Start a development server from the terminal to connect a live browser.</small></div></div>}
+        {pane === "agent" && <div className="agent-view"><div className="agent-card"><div className="agent-avatar"><Bot size={18}/></div><div><strong>Build Agent</strong><span>Scoped to {project}</span></div><button onClick={() => onAddLog("Agent thread started for this workspace.")}>Start</button></div><div className="agent-empty"><Sparkles size={24}/><h3>What should we build?</h3><p>Give the coding agent a bounded objective. It can inspect files, propose changes and run verification once a local execution backend is connected.</p></div></div>}
+        <div className="code-commandbar"><Command size={14}/><input placeholder="Ask the workspace agent to inspect, change, run or explain…" onKeyDown={e => { if (e.key === "Enter" && e.currentTarget.value.trim()) { onAddLog(`Agent request: ${e.currentTarget.value.trim()}`); e.currentTarget.value = ""; } }}/><span>⌘↵</span></div>
+      </div>
+    </div>
+  </div>;
+}
+
+function AgentWorkspace({ onOpenCode, onNewChat }: { onOpenCode: () => void; onNewChat: () => void }) {
+  const agents = [{ name: "Build Agent", role: "Software engineer", status: "Ready" }, { name: "Reviewer", role: "Code review & verification", status: "Ready" }, { name: "Researcher", role: "Technical research", status: "Ready" }];
+  return <div className="agent-workspace"><div className="agent-hero"><span className="eyebrow-inline"><i/> Agent workspace</span><h1>Build with persistent AI teammates.</h1><p>Create focused agents with clear roles, then move implementation into a project Code workspace.</p><div className="agent-actions"><button className="primary" onClick={onOpenCode}><Code2 size={14}/> Open Code workspace</button><button className="secondary" onClick={onNewChat}><MessageCircle size={14}/> New chat</button></div></div><div className="agent-roster">{agents.map(agent => <button key={agent.name} className="agent-card roster-card" onClick={onOpenCode}><div className="agent-avatar"><Bot size={17}/></div><div><strong>{agent.name}</strong><span>{agent.role}</span></div><em><i/>{agent.status}</em></button>)}</div><div className="agent-principles"><div><strong>Persistent role</strong><span>Define what the teammate owns and how it works.</span></div><div><strong>Scoped access</strong><span>Connect only the repositories, APIs and tools it needs.</span></div><div><strong>Verify before shipping</strong><span>Keep publishing and destructive actions behind approval.</span></div></div></div>;
 }
 
 function ChatTile({ chat, model, models, sending, draft, onModel, onDraft, onSend, onStop, onExpand, onExport, onClose }: { chat: Chat; model: ModelConnection | null; models: ModelConnection[]; sending: boolean; draft: string; onModel: (id: string) => void; onDraft: (value: string) => void; onSend: () => void; onStop: () => void; onExpand: () => void; onExport: () => void; onClose: () => void }) {
