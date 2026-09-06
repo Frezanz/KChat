@@ -540,12 +540,23 @@ export default function Home() {
 
   async function saveKey() {
     const value = modelForm.apiKey.trim();
-    const url = modelForm.baseUrl.trim();
     if (!value) { setKeyError("Paste your model API key first."); return; }
+
+    // Google AI Studio authorization keys use the AQ.* format. If one is pasted
+    // while OpenAI/Custom is selected, automatically route it to Gemini's
+    // official OpenAI-compatible endpoint instead of OpenAI.
+    const isGoogleAuthKey = /^AQ\./i.test(value);
+    const detectedForm: ModelConnection = isGoogleAuthKey && ["OpenAI", "Custom"].includes(modelForm.provider)
+      ? ({ ...modelForm, provider: "Gemini", name: "Gemini", ...MODEL_PRESETS.Gemini, apiKey: value } as ModelConnection)
+      : ({ ...modelForm, apiKey: value } as ModelConnection);
+    if (detectedForm.provider !== modelForm.provider || detectedForm.baseUrl !== modelForm.baseUrl || detectedForm.model !== modelForm.model) setModelForm(detectedForm);
+
+    const url = detectedForm.baseUrl.trim();
     if (!url) { setKeyError("Enter the model API base URL."); return; }
-    if (!modelForm.model.trim()) { setKeyError("Enter the model ID."); return; }
-    const connection: ModelConnection = { ...modelForm, id: modelForm.id || uid(), name: modelForm.name.trim() || modelForm.provider, baseUrl: url.replace(/\/$/, ""), model: modelForm.model.trim(), apiKey: value };
+    if (!detectedForm.model.trim()) { setKeyError("Enter the model ID."); return; }
+    const connection: ModelConnection = { ...detectedForm, id: modelForm.id || uid(), name: detectedForm.name.trim() || detectedForm.provider, baseUrl: url.replace(/\/$/, ""), model: detectedForm.model.trim() };
     setKeyTesting(true); setKeyError("");
+    if (isGoogleAuthKey && connection.provider === "Gemini") addActivityLog("info", "Detected Google Gemini authorization key (AQ.*); testing Gemini endpoint.");
     try {
       await testModelConnection(connection);
       setModelConnections((prev) => [...prev.filter((item) => item.id !== connection.id), connection]);
@@ -842,7 +853,7 @@ export default function Home() {
           <label className="field"><span>API base URL</span><input value={modelForm.baseUrl} onChange={(e) => setModelForm({...modelForm,baseUrl:e.target.value})} placeholder="https://.../v1" /></label>
           <div className="form-grid"><label className="field"><span>API key</span><input autoFocus type="password" value={modelForm.apiKey} onChange={(e) => { setModelForm({...modelForm,apiKey:e.target.value}); setKeyError(""); }} placeholder="Paste any provider key" onKeyDown={(e) => e.key === "Enter" && saveKey()} /></label><label className="field"><span>Auth header</span><input value={modelForm.authHeader} onChange={(e) => setModelForm({...modelForm,authHeader:e.target.value})} placeholder="Authorization" /></label></div>
           <div className="form-grid"><label className="field"><span>Auth prefix</span><input value={modelForm.authPrefix} onChange={(e) => setModelForm({...modelForm,authPrefix:e.target.value})} placeholder="Bearer" /></label><label className="field"><span>API protocol</span><select value={modelForm.protocol} onChange={(e) => setModelForm({...modelForm,protocol:e.target.value as ModelConnection["protocol"]})}><option value="chat">Chat Completions</option><option value="responses">Responses</option></select></label></div>
-          <div className="security-note"><KeyRound size={14} /><span>Supports Gemini, OpenAI, OpenRouter, Groq, Mistral and custom OpenAI-compatible endpoints. A native provider API that is not OpenAI-compatible needs a dedicated adapter.</span></div>{keyError && <div className="key-error" role="alert">{keyError}</div>}
+          <div className="security-note"><KeyRound size={14} /><span>Supports Gemini, OpenAI, OpenRouter, Groq, Mistral and custom OpenAI-compatible endpoints. Google AQ.* Gemini keys are detected automatically. A native provider API that is not OpenAI-compatible needs a dedicated adapter.</span></div>{keyError && <div className="key-error" role="alert">{keyError}</div>}
           <div className="modal-actions"><button className="secondary" onClick={() => setKeyOpen(false)}>Cancel</button><button className="primary" onClick={saveKey} disabled={keyTesting}>{keyTesting ? "Testing connection…" : "Test & connect"}</button></div>
         </Modal>
       )}
