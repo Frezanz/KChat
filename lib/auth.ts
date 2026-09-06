@@ -29,9 +29,10 @@ export async function createSession(userId: string) {
 }
 
 export async function getCurrentUser() {
-  await ensureDatabaseSchema();
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
   if (!token) return null;
+
+  await ensureDatabaseSchema();
   const result = await db.query(
     `SELECT u.id, u.email, u.name FROM sessions s
      JOIN users u ON u.id = s.user_id
@@ -50,3 +51,4 @@ export async function destroyCurrentSession() {
   }
   store.delete(SESSION_COOKIE);
 }
+

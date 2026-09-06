@@ -9,6 +9,8 @@ export const metadata: Metadata = {
   description: "A premium, local-first AI workspace with BYOK.",
 };
 
+export const dynamic = "force-dynamic";
+
 export default async function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   const user = await getCurrentUser();
   return <html lang="en"><body>{user ? <AccountBar email={user.email}>{children}</AccountBar> : <AuthScreen />}</body></html>;
