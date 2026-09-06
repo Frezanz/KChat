@@ -90,6 +90,8 @@ export default function Home() {
   const [error, setError] = useState("");
   const [copied, setCopied] = useState("");
   const [moreOpen, setMoreOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileUser, setProfileUser] = useState<{ email: string } | null>(null);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [chatSettingsId, setChatSettingsId] = useState<string | null>(null);
   const [attachedName, setAttachedName] = useState("");
@@ -99,6 +101,9 @@ export default function Home() {
   const [fullscreenId, setFullscreenId] = useState<string | null>(null);
   const [gridDrafts, setGridDrafts] = useState<Record<string, string>>({});
   const [gridSending, setGridSending] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    fetch("/api/auth/me", { cache: "no-store" }).then((response) => response.ok ? response.json() : null).then((data) => { if (data?.user) setProfileUser(data.user); }).catch(() => {});
+  }, []);
   const gridAbortRef = useRef<Record<string, AbortController | null>>({});
   const abortRef = useRef<Record<string, AbortController | null>>({});
   const endRef = useRef<HTMLDivElement>(null);
@@ -421,7 +426,18 @@ export default function Home() {
             <button className={`top-link grid-top-link ${gridOpen ? "selected" : ""}`} onClick={() => gridOpen ? setGridOpen(false) : openGrid()} aria-label={gridOpen ? "Return to single view" : "Open grid view"} title={gridOpen ? "Return to single view" : "Open grid view"}><LayoutGrid size={14} /><span className="grid-label">{gridOpen ? "Single view" : "Grid"}</span></button>
             <button className="top-link" onClick={() => setKeyOpen(true)}><KeyRound size={14} />{apiKey ? "Connected" : "Connect"}</button>
             <button className="icon-btn" onClick={() => setMoreOpen(v => !v)}><MoreHorizontal size={18}/></button>
-            <div className="mini-avatar">F</div>
+            <button className="mini-avatar profile-trigger" onClick={() => setProfileOpen(v => !v)} aria-label="Profile" title="Profile"><UserRound size={16}/></button>
+            {profileOpen && <div className="profile-menu">
+              {profileUser ? <>
+                <div className="profile-menu-user"><div className="profile-menu-avatar"><UserRound size={16}/></div><div><strong>{profileUser.email}</strong><span>Signed in</span></div></div>
+                <button onClick={async () => { await fetch("/api/auth/logout", { method: "POST" }); window.location.reload(); }}><UserRound size={14}/> Sign out</button>
+              </> : <>
+                <div className="profile-menu-head"><strong>Welcome to KChat</strong><span>Sign in to sync your workspace.</span></div>
+                <button onClick={() => { window.location.href = "/?auth=login"; }}><UserRound size={14}/> Sign in</button>
+                <button onClick={() => { window.location.href = "/?auth=signup"; }}><UserRound size={14}/> Create account</button>
+                <span className="profile-menu-guest">You can continue as a guest.</span>
+              </>}
+            </div>}
             {moreOpen && <div className="more-menu"><button onClick={exportActive}><Download size={14}/> Export chat</button><button onClick={clearActive}><Trash2 size={14}/> Clear conversation</button></div>}
           </div>
         </header>
